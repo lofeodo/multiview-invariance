@@ -71,6 +71,34 @@ DEFAULT_OCCLUSION_THRESH = 0.20     # fraction of rays that must reach object
 DEFAULT_MAX_PAIRS = 20              # per scene
 DEFAULT_NEAR_GEOM_DIST = 0.3        # m — camera collision threshold
 
+# ---------------------------------------------------------------------------
+# Highlight colour palette
+# ---------------------------------------------------------------------------
+# Adjacent pairs are perceptually distinct so A and B never look similar.
+# Stored as (name, float RGB in [0,1]).
+HIGHLIGHT_PALETTE: list[tuple[str, np.ndarray]] = [
+    ("yellow",  np.array([1.00, 0.85, 0.00])),
+    ("blue",    np.array([0.15, 0.45, 1.00])),
+    ("orange",  np.array([1.00, 0.50, 0.00])),
+    ("cyan",    np.array([0.00, 0.85, 0.95])),
+    ("red",     np.array([0.95, 0.15, 0.15])),
+    ("lime",    np.array([0.50, 0.95, 0.10])),
+    ("magenta", np.array([0.90, 0.10, 0.90])),
+    ("teal",    np.array([0.10, 0.80, 0.65])),
+]
+
+
+def assign_pair_colors(pair_index: int) -> tuple[str, np.ndarray, str, np.ndarray]:
+    """Return (name_a, rgb_a, name_b, rgb_b) for a given pair index.
+
+    Even-indexed palette entries go to A, odd to B, cycling through the palette
+    so consecutive pairs always get different colours from one another.
+    """
+    n = len(HIGHLIGHT_PALETTE)
+    name_a, rgb_a = HIGHLIGHT_PALETTE[(pair_index * 2) % n]
+    name_b, rgb_b = HIGHLIGHT_PALETTE[(pair_index * 2 + 1) % n]
+    return name_a, rgb_a.copy(), name_b, rgb_b.copy()
+
 
 # ---------------------------------------------------------------------------
 # Data loading helpers
@@ -583,6 +611,36 @@ def try_adjust_camera(
 
 
 # ---------------------------------------------------------------------------
+# Colour helpers
+# ---------------------------------------------------------------------------
+
+def _build_highlighted_colors(
+    mesh: o3d.geometry.TriangleMesh,
+    inst_a: dict,
+    inst_b: dict,
+    color_a_rgb: np.ndarray,
+    color_b_rgb: np.ndarray,
+) -> np.ndarray:
+    """Return (N, 3) float64 vertex colour array where:
+
+    - Object A vertices → color_a_rgb (float RGB in [0, 1])
+    - Object B vertices → color_b_rgb
+    - All other vertices → perceptual grayscale of their original colour
+    """
+    raw = (
+        np.asarray(mesh.vertex_colors)
+        if mesh.has_vertex_colors()
+        else np.ones((len(np.asarray(mesh.vertices)), 3), dtype=np.float64)
+    )
+    # Perceptual grayscale (ITU-R BT.601 luma)
+    luma = 0.299 * raw[:, 0] + 0.587 * raw[:, 1] + 0.114 * raw[:, 2]
+    result = np.stack([luma, luma, luma], axis=1).copy()
+    result[inst_a["vertex_indices"]] = color_a_rgb
+    result[inst_b["vertex_indices"]] = color_b_rgb
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Rendering  (uses PyVista/VTK for Windows-compatible headless rendering)
 # Install: pip install pyvista
 # ---------------------------------------------------------------------------
@@ -670,12 +728,24 @@ def render_scene(
     K: np.ndarray,
     width: int,
     height: int,
+    inst_a: dict | None = None,
+    inst_b: dict | None = None,
+    color_a_rgb: np.ndarray | None = None,
+    color_b_rgb: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Render the scene mesh using PyVista (VTK-based, Windows headless compatible).
+    """Render the scene using PyVista (VTK-based, Windows headless compatible).
+
+    When inst_a/inst_b and their colours are supplied, object A and B are
+    rendered in their assigned highlight colours; everything else is converted
+    to perceptual grayscale.
 
     Returns (H, W, 3) uint8 RGB array.
     """
-    pv_mesh = _o3d_mesh_to_pyvista(mesh)
+    if inst_a is not None and inst_b is not None and color_a_rgb is not None:
+        override = _build_highlighted_colors(mesh, inst_a, inst_b, color_a_rgb, color_b_rgb)
+        pv_mesh = _o3d_mesh_to_pyvista(mesh, override_colors=override)
+    else:
+        pv_mesh = _o3d_mesh_to_pyvista(mesh)
     return _pyvista_render(pv_mesh, w2c, K, width, height)
 
 
@@ -823,6 +893,7 @@ def process_scene(
     np.random.shuffle(all_pairs)
 
     viewpoint_groups: list[dict] = []
+    pair_color_index = 0  # incremented only for accepted pairs
 
     for idx_a, idx_b in all_pairs:
         if len(viewpoint_groups) >= max_pairs:
@@ -843,6 +914,9 @@ def process_scene(
             "Pair %s: %s ↔ %s (dist=%.2fm)",
             pair_id, inst_a["label"], inst_b["label"], dist,
         )
+
+        # Assign highlight colours for this pair
+        color_name_a, color_rgb_a, color_name_b, color_rgb_b = assign_pair_colors(pair_color_index)
 
         # Compute candidate camera positions
         candidates = compute_camera_candidates(
@@ -932,7 +1006,11 @@ def process_scene(
             vp_img_path = vp_dir / img_name
 
             try:
-                rgb = render_scene(mesh, vp["w2c"], K, width, height)
+                rgb = render_scene(
+                    mesh, vp["w2c"], K, width, height,
+                    inst_a=inst_a, inst_b=inst_b,
+                    color_a_rgb=color_rgb_a, color_b_rgb=color_rgb_b,
+                )
                 Image.fromarray(rgb).save(str(img_path))
                 Image.fromarray(rgb).save(str(vp_img_path))
             except Exception as exc:
@@ -1020,6 +1098,8 @@ def process_scene(
             "object_A": {
                 "instance_id": inst_a["instance_id"],
                 "label": inst_a["label"],
+                "color": color_name_a,
+                "color_rgb": [round(float(v), 3) for v in color_rgb_a],
                 "centroid_world": ca.tolist(),
                 "bbox_min_world": inst_a["bbox_min"].tolist(),
                 "bbox_max_world": inst_a["bbox_max"].tolist(),
@@ -1027,6 +1107,8 @@ def process_scene(
             "object_B": {
                 "instance_id": inst_b["instance_id"],
                 "label": inst_b["label"],
+                "color": color_name_b,
+                "color_rgb": [round(float(v), 3) for v in color_rgb_b],
                 "centroid_world": cb.tolist(),
                 "bbox_min_world": inst_b["bbox_min"].tolist(),
                 "bbox_max_world": inst_b["bbox_max"].tolist(),
@@ -1036,9 +1118,10 @@ def process_scene(
             "viewpoint_angular_separation_degrees": round(overall_ang, 2),
         }
         viewpoint_groups.append(group)
+        pair_color_index += 1
         log.info(
-            "  -> Saved pair %s: %d viewpoints, flips=%s, ang_sep=%.1f°",
-            pair_id, len(viewpoint_records), flipped, overall_ang,
+            "  -> Saved pair %s: %d viewpoints, flips=%s, ang_sep=%.1f°, colors=%s/%s",
+            pair_id, len(viewpoint_records), flipped, overall_ang, color_name_a, color_name_b,
         )
 
     # Save metadata JSON
