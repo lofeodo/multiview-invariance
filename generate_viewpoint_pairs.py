@@ -1,0 +1,1159 @@
+"""
+generate_viewpoint_pairs.py
+
+Generate viewpoint pairs/triplets from ScanNet 3D scene meshes where the
+apparent spatial relation (left/right, front/behind) between two objects
+flips between viewpoints. Used to evaluate VLM cross-viewpoint spatial
+reasoning invariance.
+
+Coordinate conventions:
+  - World space: axis-aligned so Y-up (after applying axisAlignment from
+    scene .txt). Floor is approximately the XZ plane.
+  - Camera space (OpenCV): x-right, y-down, z-forward into the scene.
+  - Open3D extrinsic = world-to-camera (w2c) 4×4 matrix.
+
+Usage:
+    # Single scene
+    python generate_viewpoint_pairs.py --scene_dir scannet_data/scene0000_00
+
+    # Batch
+    python generate_viewpoint_pairs.py --scene_dir scannet_data --batch
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import os
+import sys
+from itertools import combinations
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import open3d as o3d
+from PIL import Image
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+DEFAULT_SKIP_LABELS = {
+    "wall", "floor", "ceiling", "window", "door",
+    "doorframe", "doorpane", "curtain", "blinds",
+    "windowsill", "beam", "column", "pipe", "stair",
+    "railing", "floor mat",
+}
+DEFAULT_MIN_OBJECT_VOLUME = 0.005   # m³
+DEFAULT_MIN_CENTROID_DIST = 0.5     # m
+DEFAULT_MAX_CENTROID_DIST = 5.0     # m
+DEFAULT_STANDOFF_FACTOR = 1.5       # ×(centroid distance)
+DEFAULT_STANDOFF_MIN = 1.0          # m
+DEFAULT_STANDOFF_MAX = 4.0          # m
+DEFAULT_CAMERA_HEIGHT = 1.5         # m above floor
+DEFAULT_FOV = 60.0                  # degrees
+DEFAULT_RES_W = 1024
+DEFAULT_RES_H = 768
+DEFAULT_MIN_PROJ_SIZE = 50          # pixels
+DEFAULT_OCCLUSION_THRESH = 0.20     # fraction of rays that must reach object
+DEFAULT_MAX_PAIRS = 20              # per scene
+DEFAULT_NEAR_GEOM_DIST = 0.3        # m — camera collision threshold
+
+
+# ---------------------------------------------------------------------------
+# Data loading helpers
+# ---------------------------------------------------------------------------
+
+def load_axis_alignment(txt_path: Path) -> np.ndarray:
+    """Parse axisAlignment from scene .txt, return 4×4 float64 matrix.
+    Returns identity if the field is absent or the file does not exist."""
+    mat = np.eye(4, dtype=np.float64)
+    if not txt_path.exists():
+        log.warning("Scene .txt not found: %s — assuming identity alignment", txt_path)
+        return mat
+    with txt_path.open() as fh:
+        for line in fh:
+            if line.startswith("axisAlignment"):
+                vals = line.split("=", 1)[1].strip().split()
+                mat = np.array([float(v) for v in vals], dtype=np.float64).reshape(4, 4)
+                log.debug("axisAlignment matrix loaded from %s", txt_path)
+                return mat
+    log.debug("No axisAlignment in %s — using identity", txt_path)
+    return mat
+
+
+def load_mesh_and_instances(
+    ply_path: Path,
+    labels_ply_path: Path,
+    agg_path: Path,
+    segs_path: Path,
+    axis_mat: np.ndarray,
+    skip_labels: set[str],
+    min_volume: float,
+) -> tuple[o3d.geometry.TriangleMesh, list[dict]]:
+    """Load mesh and compute per-instance data.
+
+    Returns
+    -------
+    mesh : o3d.geometry.TriangleMesh — full scene mesh (axis-aligned, Y-up)
+    instances : list of dicts with keys
+        instance_id, label, centroid, bbox_min, bbox_max, vertex_indices
+    """
+    log.info("Loading mesh: %s", ply_path)
+    mesh = o3d.io.read_triangle_mesh(str(ply_path))
+    mesh.compute_vertex_normals()
+
+    vertices = np.asarray(mesh.vertices)  # (N, 3) before alignment
+
+    # Apply axis alignment
+    N = vertices.shape[0]
+    ones = np.ones((N, 1))
+    verts_h = np.hstack([vertices, ones])          # (N, 4)
+    verts_aligned = (axis_mat @ verts_h.T).T[:, :3]  # (N, 3)
+
+    # Overwrite mesh vertices with aligned coordinates
+    mesh.vertices = o3d.utility.Vector3dVector(verts_aligned)
+    mesh.compute_vertex_normals()
+    vertices = verts_aligned  # use aligned from here on
+
+    # Load aggregation JSON
+    with agg_path.open() as fh:
+        agg = json.load(fh)
+
+    # Load segmentation JSON
+    with segs_path.open() as fh:
+        segs_data = json.load(fh)
+    seg_indices: list[int] = segs_data["segIndices"]  # parallel to vertex array
+    seg_indices_arr = np.array(seg_indices, dtype=np.int32)
+
+    instances: list[dict] = []
+    for seg_group in agg["segGroups"]:
+        label: str = seg_group.get("label", "unknown").lower().strip()
+        if label in skip_labels:
+            continue
+
+        seg_ids = set(seg_group["segments"])
+        # Find all vertex indices whose segment ID is in this instance
+        vertex_mask = np.isin(seg_indices_arr, list(seg_ids))
+        vert_idx = np.where(vertex_mask)[0]
+        if len(vert_idx) == 0:
+            continue
+
+        pts = vertices[vert_idx]  # (k, 3)
+        centroid = pts.mean(axis=0)
+        bbox_min = pts.min(axis=0)
+        bbox_max = pts.max(axis=0)
+        dims = bbox_max - bbox_min
+        volume = float(dims[0] * dims[1] * dims[2])
+
+        if volume < min_volume:
+            continue
+
+        instances.append(
+            {
+                "instance_id": int(seg_group["objectId"]),
+                "label": label,
+                "centroid": centroid,
+                "bbox_min": bbox_min,
+                "bbox_max": bbox_max,
+                "vertex_indices": vert_idx,
+                "volume": volume,
+            }
+        )
+
+    log.info("Loaded %d valid object instances", len(instances))
+    return mesh, instances
+
+
+# ---------------------------------------------------------------------------
+# Camera math
+# ---------------------------------------------------------------------------
+
+def look_at_matrix(
+    eye: np.ndarray, target: np.ndarray, up: np.ndarray = None
+) -> np.ndarray:
+    """Compute OpenCV-convention world-to-camera (w2c) 4×4 matrix.
+
+    Convention: x-right, y-down, z-forward (into scene).
+    """
+    if up is None:
+        up = np.array([0.0, 1.0, 0.0])
+    forward = target - eye
+    forward_norm = np.linalg.norm(forward)
+    if forward_norm < 1e-8:
+        # Degenerate: camera on top of target; use fallback
+        forward = np.array([0.0, 0.0, 1.0])
+    else:
+        forward = forward / forward_norm
+
+    right = np.cross(forward, up)
+    right_norm = np.linalg.norm(right)
+    if right_norm < 1e-8:
+        # forward is parallel to up; pick another up
+        alt_up = np.array([1.0, 0.0, 0.0])
+        right = np.cross(forward, alt_up)
+        right_norm = np.linalg.norm(right)
+    right = right / right_norm
+
+    up_corrected = np.cross(right, forward)  # reorthogonalize; points upward in cam
+
+    # R maps world axes to camera axes.
+    # In OpenCV cam: x=right, y=down, z=forward
+    # up_corrected points upward in world → camera y = -up_corrected (y is down)
+    R = np.array(
+        [
+            right,
+            -up_corrected,  # camera y-axis points down
+            forward,
+        ]
+    )  # (3, 3)
+
+    # Translation: t = -R @ eye
+    t = -R @ eye.reshape(3, 1)
+
+    w2c = np.eye(4, dtype=np.float64)
+    w2c[:3, :3] = R
+    w2c[:3, 3] = t.ravel()
+    return w2c
+
+
+def intrinsic_matrix(fov_deg: float, width: int, height: int) -> np.ndarray:
+    """Compute 3×3 camera intrinsic matrix from horizontal FOV."""
+    fov_rad = math.radians(fov_deg)
+    fx = (width / 2.0) / math.tan(fov_rad / 2.0)
+    fy = fx  # square pixels
+    cx = width / 2.0
+    cy = height / 2.0
+    K = np.array(
+        [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64
+    )
+    return K
+
+
+def project_points(
+    pts_world: np.ndarray,  # (N, 3)
+    w2c: np.ndarray,         # (4, 4)
+    K: np.ndarray,           # (3, 3)
+) -> tuple[np.ndarray, np.ndarray]:
+    """Project 3D world points to 2D pixel coordinates.
+
+    Returns
+    -------
+    pts_2d : (N, 2) float pixel coordinates (x, y)
+    depths  : (N,) float z-depths in camera space
+    """
+    N = pts_world.shape[0]
+    ones = np.ones((N, 1))
+    pts_h = np.hstack([pts_world, ones]).T  # (4, N)
+    cam = w2c @ pts_h  # (4, N)
+    xyz_cam = cam[:3, :]  # (3, N)
+    depths = xyz_cam[2, :]  # z-forward
+    # Perspective divide
+    valid = depths > 1e-4
+    uv = np.full((2, N), np.nan)
+    uv[:, valid] = (K[:2, :2] @ (xyz_cam[:2, valid] / xyz_cam[2:3, valid])) + K[:2, 2:3]
+    return uv.T, depths  # (N, 2), (N,)
+
+
+def world_to_cam(pts_world: np.ndarray, w2c: np.ndarray) -> np.ndarray:
+    """Transform world points to camera-space coordinates."""
+    N = pts_world.shape[0]
+    ones = np.ones((N, 1))
+    pts_h = np.hstack([pts_world, ones]).T
+    cam = w2c @ pts_h
+    return cam[:3, :].T  # (N, 3)
+
+
+def compute_spatial_relations(
+    centroid_a_world: np.ndarray,
+    centroid_b_world: np.ndarray,
+    w2c: np.ndarray,
+) -> dict:
+    """Compute spatial relations between A and B in camera space.
+
+    Camera space convention: x-right, y-down, z-forward.
+    - left/right: sign of (x_A - x_B)  — negative ⇒ A is left of B
+    - front/behind: sign of (z_A - z_B) — negative ⇒ A is in front of B
+    - above/below: sign of (y_A - y_B)  — negative ⇒ A is above B (y-down)
+    """
+    pts = world_to_cam(np.stack([centroid_a_world, centroid_b_world]), w2c)
+    a_cam, b_cam = pts[0], pts[1]
+    return {
+        "A_left_of_B": bool(a_cam[0] < b_cam[0]),
+        "A_in_front_of_B": bool(a_cam[2] < b_cam[2]),
+        "A_above_B": bool(a_cam[1] < b_cam[1]),  # y-down ⇒ smaller y is higher
+        "_a_cam": a_cam.tolist(),
+        "_b_cam": b_cam.tolist(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Camera placement
+# ---------------------------------------------------------------------------
+
+def compute_camera_candidates(
+    centroid_a: np.ndarray,
+    centroid_b: np.ndarray,
+    floor_y: float,
+    camera_height: float,
+    standoff_factor: float,
+    standoff_min: float,
+    standoff_max: float,
+) -> list[dict]:
+    """Analytically compute candidate camera positions that produce relation flips.
+
+    Produces up to 4 positions:
+      0 : left side of AB midpoint  (left/right flip pair with pos 1)
+      1 : right side
+      2 : AB-side (same as A, along AB axis) — front/behind flip pair with pos 3
+      3 : BA-side (closer to B along axis)
+      4 : diagonal
+
+    Each dict has: eye (np.ndarray), target (np.ndarray), label (str).
+    """
+    M = (centroid_a + centroid_b) / 2.0
+
+    # Ground-plane projection (zero out Y component — Y is up)
+    d_ab_full = centroid_b - centroid_a
+    d_ab_gnd = np.array([d_ab_full[0], 0.0, d_ab_full[2]])
+    dist_gnd = np.linalg.norm(d_ab_gnd)
+
+    if dist_gnd < 1e-4:
+        # Objects are vertically stacked — left/right flip is degenerate
+        log.debug("Objects nearly vertically stacked; skipping pair")
+        return []
+
+    d_ab_gnd_norm = d_ab_gnd / dist_gnd
+
+    # Perpendicular in XZ plane (rotate 90° around Y)
+    d_perp = np.array([-d_ab_gnd_norm[2], 0.0, d_ab_gnd_norm[0]])
+
+    # Standoff distance
+    r = float(np.clip(standoff_factor * dist_gnd, standoff_min, standoff_max))
+
+    # Eye height
+    eye_y = floor_y + camera_height
+
+    target = M.copy()
+    target[1] = (centroid_a[1] + centroid_b[1]) / 2.0  # look at obj midpoint height
+
+    candidates: list[dict] = []
+
+    def make_eye(offset_3d: np.ndarray, label: str) -> dict:
+        eye = M + offset_3d
+        eye[1] = eye_y
+        return {"eye": eye.copy(), "target": target.copy(), "label": label}
+
+    # Left/right flip positions (perpendicular to AB)
+    candidates.append(make_eye(r * d_perp, "perp_pos"))
+    candidates.append(make_eye(-r * d_perp, "perp_neg"))
+
+    # Front/behind flip positions (along AB axis)
+    candidates.append(make_eye(r * d_ab_gnd_norm, "along_pos"))
+    candidates.append(make_eye(-r * d_ab_gnd_norm, "along_neg"))
+
+    # Diagonal viewpoints
+    diag1 = (d_ab_gnd_norm + d_perp)
+    diag1 /= np.linalg.norm(diag1)
+    diag2 = (d_ab_gnd_norm - d_perp)
+    diag2 /= np.linalg.norm(diag2)
+    candidates.append(make_eye(r * diag1, "diag_0"))
+    candidates.append(make_eye(r * diag2, "diag_1"))
+
+    return candidates
+
+
+# ---------------------------------------------------------------------------
+# Raycasting / validation
+# ---------------------------------------------------------------------------
+
+def build_raycasting_scene(mesh: o3d.geometry.TriangleMesh) -> o3d.t.geometry.RaycastingScene:
+    """Build an Open3D tensor raycasting scene from a legacy mesh."""
+    scene = o3d.t.geometry.RaycastingScene()
+    mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
+    scene.add_triangles(mesh_t)
+    return scene
+
+
+def nearest_geometry_distance(
+    scene: o3d.t.geometry.RaycastingScene,
+    point: np.ndarray,
+) -> float:
+    """Return distance from `point` to the nearest mesh surface."""
+    query = o3d.core.Tensor(point.reshape(1, 3).astype(np.float32), dtype=o3d.core.Dtype.Float32)
+    result = scene.compute_closest_points(query)
+    closest = result["points"].numpy()  # (1, 3)
+    return float(np.linalg.norm(closest[0] - point))
+
+
+def check_occlusion(
+    scene: o3d.t.geometry.RaycastingScene,
+    camera_pos: np.ndarray,
+    object_vertices: np.ndarray,  # (k, 3) world coords
+    threshold: float,
+    n_samples: int = 32,
+) -> float:
+    """Return fraction of sampled rays from camera to object vertices that are
+    unobstructed (or reach within 5 cm of the target vertex).
+
+    Returns fraction in [0, 1]. Higher = more visible.
+    """
+    if len(object_vertices) == 0:
+        return 0.0
+
+    # Sample up to n_samples vertices
+    idx = np.random.choice(len(object_vertices), size=min(n_samples, len(object_vertices)), replace=False)
+    targets = object_vertices[idx]
+
+    origins = np.tile(camera_pos.astype(np.float32), (len(targets), 1))
+    directions = targets.astype(np.float32) - origins
+    norms = np.linalg.norm(directions, axis=1, keepdims=True)
+    valid = (norms[:, 0] > 1e-4)
+    directions[valid] = directions[valid] / norms[valid]
+    expected_dist = norms[:, 0]
+
+    rays = o3d.core.Tensor(
+        np.hstack([origins, directions]).astype(np.float32),
+        dtype=o3d.core.Dtype.Float32,
+    )
+    hits = scene.cast_rays(rays)
+    hit_dist = hits["t_hit"].numpy()  # (N,)
+
+    # A ray reaches the object if it hits at roughly the expected distance (±0.1m)
+    reached = np.sum(
+        (hit_dist >= expected_dist - 0.15) & (hit_dist < expected_dist + 0.15)
+    )
+    return float(reached) / len(targets)
+
+
+def objects_in_frustum(
+    centroid: np.ndarray,
+    bbox_min: np.ndarray,
+    bbox_max: np.ndarray,
+    w2c: np.ndarray,
+    K: np.ndarray,
+    width: int,
+    height: int,
+    min_size: int,
+) -> bool:
+    """Check that the object's 2D projected bbox is at least min_size×min_size
+    pixels and substantially within the image bounds."""
+    # Sample 8 bbox corners + centroid
+    corners = np.array(
+        [
+            [bbox_min[0], bbox_min[1], bbox_min[2]],
+            [bbox_max[0], bbox_min[1], bbox_min[2]],
+            [bbox_min[0], bbox_max[1], bbox_min[2]],
+            [bbox_max[0], bbox_max[1], bbox_min[2]],
+            [bbox_min[0], bbox_min[1], bbox_max[2]],
+            [bbox_max[0], bbox_min[1], bbox_max[2]],
+            [bbox_min[0], bbox_max[1], bbox_max[2]],
+            [bbox_max[0], bbox_max[1], bbox_max[2]],
+            centroid,
+        ],
+        dtype=np.float64,
+    )
+    pts_2d, depths = project_points(corners, w2c, K)
+    front_mask = depths > 0.1
+    if not np.any(front_mask):
+        return False
+
+    visible_pts = pts_2d[front_mask]
+    in_frame = (
+        (visible_pts[:, 0] >= 0)
+        & (visible_pts[:, 0] < width)
+        & (visible_pts[:, 1] >= 0)
+        & (visible_pts[:, 1] < height)
+    )
+    if not np.any(in_frame):
+        return False
+
+    x_min = np.min(visible_pts[in_frame, 0])
+    x_max = np.max(visible_pts[in_frame, 0])
+    y_min = np.min(visible_pts[in_frame, 1])
+    y_max = np.max(visible_pts[in_frame, 1])
+
+    return (x_max - x_min) >= min_size and (y_max - y_min) >= min_size
+
+
+def validate_camera(
+    eye: np.ndarray,
+    target: np.ndarray,
+    mesh: o3d.geometry.TriangleMesh,
+    scene_rc: o3d.t.geometry.RaycastingScene,
+    inst_a: dict,
+    inst_b: dict,
+    w2c: np.ndarray,
+    K: np.ndarray,
+    width: int,
+    height: int,
+    min_proj_size: int,
+    occlusion_thresh: float,
+    near_geom_dist: float,
+    vertices: np.ndarray,
+) -> bool:
+    """Return True if this camera placement passes all validity checks."""
+    # 1) Camera not too close to geometry
+    d = nearest_geometry_distance(scene_rc, eye)
+    if d < near_geom_dist:
+        log.debug("Camera too close to geometry (%.3fm)", d)
+        return False
+
+    # 2) Occlusion check for both objects
+    verts_a = vertices[inst_a["vertex_indices"]]
+    vis_a = check_occlusion(scene_rc, eye, verts_a, occlusion_thresh)
+    if vis_a < occlusion_thresh:
+        log.debug("Object A occluded (%.1f%% visible)", vis_a * 100)
+        return False
+
+    verts_b = vertices[inst_b["vertex_indices"]]
+    vis_b = check_occlusion(scene_rc, eye, verts_b, occlusion_thresh)
+    if vis_b < occlusion_thresh:
+        log.debug("Object B occluded (%.1f%% visible)", vis_b * 100)
+        return False
+
+    # 3) Both objects in frustum and large enough
+    if not objects_in_frustum(
+        inst_a["centroid"], inst_a["bbox_min"], inst_a["bbox_max"],
+        w2c, K, width, height, min_proj_size,
+    ):
+        log.debug("Object A not sufficiently in frustum")
+        return False
+    if not objects_in_frustum(
+        inst_b["centroid"], inst_b["bbox_min"], inst_b["bbox_max"],
+        w2c, K, width, height, min_proj_size,
+    ):
+        log.debug("Object B not sufficiently in frustum")
+        return False
+
+    return True
+
+
+def try_adjust_camera(
+    eye_orig: np.ndarray,
+    target: np.ndarray,
+    mesh: o3d.geometry.TriangleMesh,
+    scene_rc: o3d.t.geometry.RaycastingScene,
+    inst_a: dict,
+    inst_b: dict,
+    K: np.ndarray,
+    width: int,
+    height: int,
+    min_proj_size: int,
+    occlusion_thresh: float,
+    near_geom_dist: float,
+    vertices: np.ndarray,
+    n_steps: int = 5,
+    step_size: float = 0.3,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Try to find a valid camera position by stepping outward from eye_orig.
+
+    Returns (eye, w2c) if found, else (None, None).
+    """
+    direction = eye_orig - target
+    d_norm = np.linalg.norm(direction)
+    if d_norm < 1e-6:
+        return None, None
+    direction = direction / d_norm
+
+    for i in range(n_steps + 1):
+        eye = eye_orig + direction * (i * step_size)
+        up = np.array([0.0, 1.0, 0.0])
+        w2c = look_at_matrix(eye, target, up)
+        if validate_camera(
+            eye, target, mesh, scene_rc, inst_a, inst_b,
+            w2c, K, width, height, min_proj_size,
+            occlusion_thresh, near_geom_dist, vertices,
+        ):
+            return eye, w2c
+
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# Rendering  (uses PyVista/VTK for Windows-compatible headless rendering)
+# Install: pip install pyvista
+# ---------------------------------------------------------------------------
+
+def _w2c_to_pyvista_camera(w2c: np.ndarray, K: np.ndarray, height: int):
+    """Convert OpenCV w2c matrix + intrinsics to PyVista camera parameters.
+
+    Returns (position, focal_point, up, view_angle_deg).
+    - position    : camera eye in world coordinates
+    - focal_point : a point along the look direction (1 m in front)
+    - up          : world-space up vector (OpenCV y-down → negate cam y-axis)
+    - view_angle  : vertical FOV in degrees
+    """
+    R = w2c[:3, :3]
+    t = w2c[:3, 3]
+    position = (-R.T @ t)                   # world position of camera
+    forward_world = R[2, :]                 # camera z-axis in world space
+    up_world = -R[1, :]                     # camera -y-axis = world up (y-down conv)
+    focal_point = position + forward_world  # 1 m along look direction
+
+    fy = K[1, 1]
+    view_angle_deg = float(2.0 * math.degrees(math.atan(height / (2.0 * fy))))
+
+    return position, focal_point, up_world, view_angle_deg
+
+
+def _o3d_mesh_to_pyvista(mesh: o3d.geometry.TriangleMesh, override_colors: np.ndarray | None = None):
+    """Convert an Open3D TriangleMesh to a PyVista PolyData with RGB point data.
+
+    Parameters
+    ----------
+    override_colors : (N, 3) float64 in [0, 1], optional.
+        If given, used instead of the mesh's own vertex_colors.
+    """
+    import pyvista as pv
+
+    vertices = np.asarray(mesh.vertices)
+    triangles = np.asarray(mesh.triangles)
+
+    if override_colors is not None:
+        raw_colors = override_colors
+    elif mesh.has_vertex_colors():
+        raw_colors = np.asarray(mesh.vertex_colors)
+    else:
+        raw_colors = np.ones((len(vertices), 3))
+
+    colors_u8 = (np.clip(raw_colors, 0.0, 1.0) * 255).astype(np.uint8)
+
+    # PyVista faces format: [n_pts, i0, i1, i2, ...]
+    faces = np.hstack(
+        [np.full((len(triangles), 1), 3, dtype=np.int32), triangles]
+    ).ravel()
+
+    pv_mesh = pv.PolyData(vertices, faces)
+    pv_mesh.point_data["RGB"] = colors_u8
+    return pv_mesh
+
+
+def _pyvista_render(pv_mesh, w2c: np.ndarray, K: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Render a PyVista mesh with the given camera and return (H, W, 3) uint8."""
+    import pyvista as pv
+
+    position, focal_point, up_world, view_angle = _w2c_to_pyvista_camera(w2c, K, height)
+
+    plotter = pv.Plotter(off_screen=True, window_size=[width, height])
+    plotter.set_background("black")
+    plotter.add_mesh(pv_mesh, scalars="RGB", rgb=True, show_scalar_bar=False)
+
+    plotter.camera.position = position.tolist()
+    plotter.camera.focal_point = focal_point.tolist()
+    plotter.camera.up = up_world.tolist()
+    plotter.camera.view_angle = view_angle
+
+    img = plotter.screenshot(return_img=True, window_size=[width, height])
+    plotter.close()
+
+    if img.ndim == 3 and img.shape[2] == 4:
+        img = img[:, :, :3]
+    return img.astype(np.uint8)
+
+
+def render_scene(
+    mesh: o3d.geometry.TriangleMesh,
+    w2c: np.ndarray,
+    K: np.ndarray,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    """Render the scene mesh using PyVista (VTK-based, Windows headless compatible).
+
+    Returns (H, W, 3) uint8 RGB array.
+    """
+    pv_mesh = _o3d_mesh_to_pyvista(mesh)
+    return _pyvista_render(pv_mesh, w2c, K, width, height)
+
+
+def render_instance_mask(
+    mesh: o3d.geometry.TriangleMesh,
+    inst_a: dict,
+    inst_b: dict,
+    w2c: np.ndarray,
+    K: np.ndarray,
+    width: int,
+    height: int,
+) -> tuple[list | None, list | None]:
+    """Render an instance-colour mask and derive 2D bounding boxes.
+
+    Assigns red to object A, green to object B, black to everything else.
+    Returns (bbox_a, bbox_b) where each bbox is [x1, y1, x2, y2] or None.
+    """
+    n_verts = len(np.asarray(mesh.vertices))
+    colors = np.zeros((n_verts, 3), dtype=np.float64)
+    colors[inst_a["vertex_indices"]] = [1.0, 0.0, 0.0]
+    colors[inst_b["vertex_indices"]] = [0.0, 1.0, 0.0]
+
+    pv_mesh = _o3d_mesh_to_pyvista(mesh, override_colors=colors)
+    img = _pyvista_render(pv_mesh, w2c, K, width, height)
+
+    def bbox_from_mask(channel_idx: int, threshold: int = 100) -> list[int] | None:
+        mask = img[:, :, channel_idx] > threshold
+        ys, xs = np.where(mask)
+        if len(xs) == 0:
+            return None
+        return [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+
+    return bbox_from_mask(0), bbox_from_mask(1)  # red=A, green=B
+
+
+# ---------------------------------------------------------------------------
+# Pair selection and angular separation
+# ---------------------------------------------------------------------------
+
+def angular_separation(eye0: np.ndarray, eye1: np.ndarray, focus: np.ndarray) -> float:
+    """Return angle in degrees between two camera rays from the focus point."""
+    v0 = eye0 - focus
+    v1 = eye1 - focus
+    n0, n1 = np.linalg.norm(v0), np.linalg.norm(v1)
+    if n0 < 1e-6 or n1 < 1e-6:
+        return 0.0
+    cos_a = np.clip(np.dot(v0 / n0, v1 / n1), -1.0, 1.0)
+    return float(math.degrees(math.acos(cos_a)))
+
+
+def detect_up_axis(axis_mat: np.ndarray) -> int:
+    """Detect which world axis (0=X,1=Y,2=Z) is 'up' after alignment.
+
+    ScanNet typically ends up Y-up after the axisAlignment transform.
+    We check which column of the rotation part has the largest dot with [0,1,0].
+    """
+    R = axis_mat[:3, :3]
+    world_y = np.array([0.0, 1.0, 0.0])
+    dots = np.abs(R.T @ world_y)
+    return int(np.argmax(dots))
+
+
+# ---------------------------------------------------------------------------
+# Main scene processing
+# ---------------------------------------------------------------------------
+
+def process_scene(
+    scene_dir: Path,
+    output_dir: Path,
+    *,
+    skip_labels: set[str],
+    min_object_volume: float,
+    min_centroid_dist: float,
+    max_centroid_dist: float,
+    standoff_factor: float,
+    standoff_min: float,
+    standoff_max: float,
+    camera_height: float,
+    fov: float,
+    width: int,
+    height: int,
+    min_proj_size: int,
+    occlusion_thresh: float,
+    max_pairs: int,
+    near_geom_dist: float,
+) -> None:
+    """Process a single ScanNet scene directory."""
+    scene_id = scene_dir.name
+    log.info("=== Processing scene: %s ===", scene_id)
+
+    # Locate files
+    ply_path = scene_dir / f"{scene_id}_vh_clean_2.ply"
+    labels_ply_path = scene_dir / f"{scene_id}_vh_clean_2.labels.ply"
+    agg_path = scene_dir / f"{scene_id}.aggregation.json"
+    segs_path = scene_dir / f"{scene_id}_vh_clean_2.0.010000.segs.json"
+    txt_path = scene_dir / f"{scene_id}.txt"
+
+    for p in [ply_path, agg_path, segs_path]:
+        if not p.exists():
+            log.error("Required file missing: %s — skipping scene", p)
+            return
+
+    # Load axis alignment
+    axis_mat = load_axis_alignment(txt_path)
+    up_axis = detect_up_axis(axis_mat)
+    log.info("Up axis after alignment: %d (0=X,1=Y,2=Z)", up_axis)
+
+    # Load mesh and instances
+    mesh, instances = load_mesh_and_instances(
+        ply_path, labels_ply_path, agg_path, segs_path,
+        axis_mat, skip_labels, min_object_volume,
+    )
+
+    if len(instances) < 2:
+        log.warning("Scene %s has fewer than 2 valid instances — skipping", scene_id)
+        return
+
+    vertices = np.asarray(mesh.vertices)
+
+    # Floor height: Y-up means floor is minimum Y
+    if up_axis == 1:
+        floor_y = float(vertices[:, 1].min())
+    elif up_axis == 2:
+        floor_y = float(vertices[:, 2].min())
+        log.warning("Z-up scene detected; camera height logic uses Z axis")
+    else:
+        floor_y = float(vertices[:, 1].min())
+
+    # Camera intrinsics
+    K = intrinsic_matrix(fov, width, height)
+
+    # Build raycasting scene once
+    log.info("Building raycasting scene...")
+    scene_rc = build_raycasting_scene(mesh)
+
+    # Output dirs
+    scene_out = output_dir / scene_id
+    img_dir = scene_out / "images"
+    vp_dir = output_dir / "viewpoints" / f"scene{scene_id.replace('scene', '')}"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    vp_dir.mkdir(parents=True, exist_ok=True)
+
+    # Enumerate pairs
+    all_pairs = list(combinations(range(len(instances)), 2))
+    np.random.shuffle(all_pairs)
+
+    viewpoint_groups: list[dict] = []
+
+    for idx_a, idx_b in all_pairs:
+        if len(viewpoint_groups) >= max_pairs:
+            break
+
+        inst_a = instances[idx_a]
+        inst_b = instances[idx_b]
+
+        ca = inst_a["centroid"]
+        cb = inst_b["centroid"]
+        dist = float(np.linalg.norm(ca - cb))
+
+        if not (min_centroid_dist <= dist <= max_centroid_dist):
+            continue
+
+        pair_id = f"{inst_a['instance_id']}_{inst_b['instance_id']}"
+        log.info(
+            "Pair %s: %s ↔ %s (dist=%.2fm)",
+            pair_id, inst_a["label"], inst_b["label"], dist,
+        )
+
+        # Compute candidate camera positions
+        candidates = compute_camera_candidates(
+            ca, cb, floor_y, camera_height,
+            standoff_factor, standoff_min, standoff_max,
+        )
+        if not candidates:
+            continue
+
+        # Validate each candidate
+        valid_viewpoints: list[dict] = []
+        for cand in candidates:
+            eye_cand = cand["eye"]
+            tgt_cand = cand["target"]
+            up = np.array([0.0, 1.0, 0.0])
+
+            w2c_cand = look_at_matrix(eye_cand, tgt_cand, up)
+
+            eye_final, w2c_final = try_adjust_camera(
+                eye_cand, tgt_cand, mesh, scene_rc,
+                inst_a, inst_b, K, width, height,
+                min_proj_size, occlusion_thresh, near_geom_dist, vertices,
+            )
+            if eye_final is None:
+                log.debug("Candidate %s invalid after adjustment", cand["label"])
+                continue
+
+            valid_viewpoints.append(
+                {
+                    "eye": eye_final,
+                    "target": tgt_cand,
+                    "w2c": w2c_final,
+                    "label": cand["label"],
+                }
+            )
+
+        if len(valid_viewpoints) < 2:
+            log.info("  Fewer than 2 valid viewpoints — skipping pair")
+            continue
+
+        # Compute spatial relations for all valid viewpoints
+        rels = [
+            compute_spatial_relations(ca, cb, vp["w2c"])
+            for vp in valid_viewpoints
+        ]
+
+        # Check that at least one flip occurs (left/right or front/behind)
+        flipped: list[str] = []
+        r0 = rels[0]
+        for ri in rels[1:]:
+            if ri["A_left_of_B"] != r0["A_left_of_B"]:
+                if "left_right" not in flipped:
+                    flipped.append("left_right")
+            if ri["A_in_front_of_B"] != r0["A_in_front_of_B"]:
+                if "front_behind" not in flipped:
+                    flipped.append("front_behind")
+
+        if not flipped:
+            log.info("  No relation flip detected — skipping pair")
+            continue
+
+        # Cap at 3 viewpoints (prefer the flip pair + one diagonal)
+        # Ensure we keep viewpoints from both sides of the flip
+        selected_vps: list[dict] = []
+        selected_rels: list[dict] = []
+        # Keep at most one from each "side" (perp_pos/perp_neg, along_pos/along_neg)
+        seen_sides = set()
+        for vp, rel in zip(valid_viewpoints, rels):
+            if len(selected_vps) >= 3:
+                break
+            side_key = vp["label"]
+            if side_key not in seen_sides:
+                selected_vps.append(vp)
+                selected_rels.append(rel)
+                seen_sides.add(side_key)
+
+        if len(selected_vps) < 2:
+            continue
+
+        # Render images and compute 2D bboxes
+        viewpoint_records: list[dict] = []
+        any_render_failed = False
+
+        for vi, (vp, rel) in enumerate(zip(selected_vps, selected_rels)):
+            img_name = f"objA_{inst_a['instance_id']}_objB_{inst_b['instance_id']}_view_{vi}.png"
+            img_path = img_dir / img_name
+            vp_img_path = vp_dir / img_name
+
+            try:
+                rgb = render_scene(mesh, vp["w2c"], K, width, height)
+                Image.fromarray(rgb).save(str(img_path))
+                Image.fromarray(rgb).save(str(vp_img_path))
+            except Exception as exc:
+                log.warning("  Render failed for viewpoint %d: %s", vi, exc)
+                any_render_failed = True
+                break
+
+            # 2D bounding boxes via instance mask render
+            try:
+                bbox_a, bbox_b = render_instance_mask(
+                    mesh, inst_a, inst_b, vp["w2c"], K, width, height
+                )
+            except Exception as exc:
+                log.warning("  Instance mask failed: %s — falling back to projected bbox", exc)
+                bbox_a = None
+                bbox_b = None
+
+            # Fallback: project bbox corners
+            if bbox_a is None:
+                pts_2d_a, depths_a = project_points(
+                    np.array([inst_a["centroid"]]), vp["w2c"], K
+                )
+                if depths_a[0] > 0:
+                    u, v_ = float(pts_2d_a[0, 0]), float(pts_2d_a[0, 1])
+                    bbox_a = [max(0, int(u) - 25), max(0, int(v_) - 25),
+                              min(width, int(u) + 25), min(height, int(v_) + 25)]
+                else:
+                    bbox_a = [0, 0, 0, 0]
+
+            if bbox_b is None:
+                pts_2d_b, depths_b = project_points(
+                    np.array([inst_b["centroid"]]), vp["w2c"], K
+                )
+                if depths_b[0] > 0:
+                    u, v_ = float(pts_2d_b[0, 0]), float(pts_2d_b[0, 1])
+                    bbox_b = [max(0, int(u) - 25), max(0, int(v_) - 25),
+                              min(width, int(u) + 25), min(height, int(v_) + 25)]
+                else:
+                    bbox_b = [0, 0, 0, 0]
+
+            # Angular separation with previous viewpoint
+            ang_sep = 0.0
+            if vi > 0:
+                ang_sep = angular_separation(
+                    selected_vps[0]["eye"], vp["eye"],
+                    (ca + cb) / 2.0,
+                )
+
+            rel_clean = {k: v for k, v in rel.items() if not k.startswith("_")}
+            a_cam = rel["_a_cam"]
+            b_cam = rel["_b_cam"]
+
+            viewpoint_records.append(
+                {
+                    "viewpoint_index": vi,
+                    "image_path": f"images/{img_name}",
+                    "camera_position_world": vp["eye"].tolist(),
+                    "camera_look_at_world": vp["target"].tolist(),
+                    "camera_up": [0.0, 1.0, 0.0],
+                    "camera_extrinsic_w2c": vp["w2c"].tolist(),
+                    "camera_intrinsic": K.tolist(),
+                    "fov_degrees": fov,
+                    "image_resolution": [width, height],
+                    "object_A_bbox_2d": bbox_a,
+                    "object_B_bbox_2d": bbox_b,
+                    "object_A_cam_coords": a_cam,
+                    "object_B_cam_coords": b_cam,
+                    "spatial_relations": rel_clean,
+                    "viewpoint_label": vp["label"],
+                    "angular_sep_from_view0_deg": round(ang_sep, 2),
+                }
+            )
+
+        if any_render_failed or len(viewpoint_records) < 2:
+            continue
+
+        # Overall angular separation (view 0 → view 1)
+        overall_ang = angular_separation(
+            selected_vps[0]["eye"], selected_vps[1]["eye"],
+            (ca + cb) / 2.0,
+        )
+
+        group = {
+            "pair_id": pair_id,
+            "object_A": {
+                "instance_id": inst_a["instance_id"],
+                "label": inst_a["label"],
+                "centroid_world": ca.tolist(),
+                "bbox_min_world": inst_a["bbox_min"].tolist(),
+                "bbox_max_world": inst_a["bbox_max"].tolist(),
+            },
+            "object_B": {
+                "instance_id": inst_b["instance_id"],
+                "label": inst_b["label"],
+                "centroid_world": cb.tolist(),
+                "bbox_min_world": inst_b["bbox_min"].tolist(),
+                "bbox_max_world": inst_b["bbox_max"].tolist(),
+            },
+            "viewpoints": viewpoint_records,
+            "flipped_relations": flipped,
+            "viewpoint_angular_separation_degrees": round(overall_ang, 2),
+        }
+        viewpoint_groups.append(group)
+        log.info(
+            "  -> Saved pair %s: %d viewpoints, flips=%s, ang_sep=%.1f°",
+            pair_id, len(viewpoint_records), flipped, overall_ang,
+        )
+
+    # Save metadata JSON
+    metadata = {
+        "scene_id": scene_id,
+        "axis_alignment_applied": True,
+        "up_axis": ["X", "Y", "Z"][up_axis],
+        "camera_conventions": "OpenCV (x-right, y-down, z-forward)",
+        "viewpoint_groups": viewpoint_groups,
+    }
+    meta_path = scene_out / "metadata.json"
+    with meta_path.open("w") as fh:
+        json.dump(metadata, fh, indent=2)
+
+    log.info(
+        "Scene %s done: %d viewpoint groups saved to %s",
+        scene_id, len(viewpoint_groups), scene_out,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Generate viewpoint pairs from ScanNet scenes for VLM spatial reasoning evaluation."
+    )
+    p.add_argument(
+        "--scene_dir",
+        required=True,
+        help="Path to a single scene dir OR to the root scannet dir (use with --batch).",
+    )
+    p.add_argument(
+        "--output_dir",
+        default="outputs",
+        help="Root output directory. Default: outputs/",
+    )
+    p.add_argument(
+        "--batch",
+        action="store_true",
+        help="Treat --scene_dir as a root containing multiple scene subdirectories.",
+    )
+    p.add_argument("--min_object_volume", type=float, default=DEFAULT_MIN_OBJECT_VOLUME)
+    p.add_argument("--min_centroid_distance", type=float, default=DEFAULT_MIN_CENTROID_DIST)
+    p.add_argument("--max_centroid_distance", type=float, default=DEFAULT_MAX_CENTROID_DIST)
+    p.add_argument("--standoff_distance_factor", type=float, default=DEFAULT_STANDOFF_FACTOR)
+    p.add_argument("--standoff_min", type=float, default=DEFAULT_STANDOFF_MIN)
+    p.add_argument("--standoff_max", type=float, default=DEFAULT_STANDOFF_MAX)
+    p.add_argument("--camera_height", type=float, default=DEFAULT_CAMERA_HEIGHT)
+    p.add_argument("--fov", type=float, default=DEFAULT_FOV)
+    p.add_argument("--resolution_w", type=int, default=DEFAULT_RES_W)
+    p.add_argument("--resolution_h", type=int, default=DEFAULT_RES_H)
+    p.add_argument("--min_projected_size", type=int, default=DEFAULT_MIN_PROJ_SIZE)
+    p.add_argument("--occlusion_ray_threshold", type=float, default=DEFAULT_OCCLUSION_THRESH)
+    p.add_argument("--max_pairs_per_scene", type=int, default=DEFAULT_MAX_PAIRS)
+    p.add_argument(
+        "--skip_labels",
+        nargs="+",
+        default=None,
+        help="Space-separated list of object labels to skip. Overrides default list.",
+    )
+    p.add_argument("--near_geom_dist", type=float, default=DEFAULT_NEAR_GEOM_DIST)
+    p.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    p.add_argument(
+        "--log_level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    logging.getLogger().setLevel(getattr(logging, args.log_level))
+    np.random.seed(args.seed)
+
+    skip_labels = set(args.skip_labels) if args.skip_labels is not None else DEFAULT_SKIP_LABELS
+
+    kwargs = dict(
+        skip_labels=skip_labels,
+        min_object_volume=args.min_object_volume,
+        min_centroid_dist=args.min_centroid_distance,
+        max_centroid_dist=args.max_centroid_distance,
+        standoff_factor=args.standoff_distance_factor,
+        standoff_min=args.standoff_min,
+        standoff_max=args.standoff_max,
+        camera_height=args.camera_height,
+        fov=args.fov,
+        width=args.resolution_w,
+        height=args.resolution_h,
+        min_proj_size=args.min_projected_size,
+        occlusion_thresh=args.occlusion_ray_threshold,
+        max_pairs=args.max_pairs_per_scene,
+        near_geom_dist=args.near_geom_dist,
+    )
+
+    scene_dir = Path(args.scene_dir)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.batch:
+        scene_dirs = sorted(
+            d for d in scene_dir.iterdir()
+            if d.is_dir() and d.name.startswith("scene")
+        )
+        log.info("Batch mode: found %d scene directories", len(scene_dirs))
+        for sd in scene_dirs:
+            try:
+                process_scene(sd, output_dir, **kwargs)
+            except Exception as exc:
+                log.exception("Scene %s failed: %s", sd.name, exc)
+    else:
+        process_scene(scene_dir, output_dir, **kwargs)
+
+
+if __name__ == "__main__":
+    main()
