@@ -339,6 +339,7 @@ def compute_camera_candidates(
     standoff_factor: float,
     standoff_min: float,
     standoff_max: float,
+    up_idx: int = 1,
 ) -> list[dict]:
     """Analytically compute candidate camera positions that produce relation flips.
 
@@ -353,9 +354,10 @@ def compute_camera_candidates(
     """
     M = (centroid_a + centroid_b) / 2.0
 
-    # Ground-plane projection (zero out Y component — Y is up)
+    # Ground-plane projection: zero out the up axis component
     d_ab_full = centroid_b - centroid_a
-    d_ab_gnd = np.array([d_ab_full[0], 0.0, d_ab_full[2]])
+    d_ab_gnd = d_ab_full.copy()
+    d_ab_gnd[up_idx] = 0.0
     dist_gnd = np.linalg.norm(d_ab_gnd)
 
     if dist_gnd < 1e-4:
@@ -365,23 +367,29 @@ def compute_camera_candidates(
 
     d_ab_gnd_norm = d_ab_gnd / dist_gnd
 
-    # Perpendicular in XZ plane (rotate 90° around Y)
-    d_perp = np.array([-d_ab_gnd_norm[2], 0.0, d_ab_gnd_norm[0]])
+    # Perpendicular in the ground plane (rotate 90° around the up axis)
+    # Works for both Y-up (idx=1) and Z-up (idx=2)
+    axes = [0, 1, 2]
+    ground_axes = [a for a in axes if a != up_idx]  # the two horizontal axes
+    h0, h1 = ground_axes
+    d_perp = np.zeros(3)
+    d_perp[h0] = -d_ab_gnd_norm[h1]
+    d_perp[h1] =  d_ab_gnd_norm[h0]
 
     # Standoff distance
     r = float(np.clip(standoff_factor * dist_gnd, standoff_min, standoff_max))
 
-    # Eye height
-    eye_y = floor_y + camera_height
+    # Eye height: floor + camera_height, clamped above the objects' midpoint height
+    eye_h = floor_y + camera_height
 
     target = M.copy()
-    target[1] = (centroid_a[1] + centroid_b[1]) / 2.0  # look at obj midpoint height
+    target[up_idx] = (centroid_a[up_idx] + centroid_b[up_idx]) / 2.0
 
     candidates: list[dict] = []
 
     def make_eye(offset_3d: np.ndarray, label: str) -> dict:
         eye = M + offset_3d
-        eye[1] = eye_y
+        eye[up_idx] = eye_h
         return {"eye": eye.copy(), "target": target.copy(), "label": label}
 
     # Left/right flip positions (perpendicular to AB)
@@ -583,10 +591,17 @@ def try_adjust_camera(
     occlusion_thresh: float,
     near_geom_dist: float,
     vertices: np.ndarray,
+    floor_y: float,
+    up_idx: int = 1,
     n_steps: int = 5,
     step_size: float = 0.3,
+    min_height_above_floor: float = 0.5,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
     """Try to find a valid camera position by stepping outward from eye_orig.
+
+    The camera's up-axis coordinate is clamped to at least
+    floor_y + min_height_above_floor at every step so the camera never dips
+    below the floor surface, regardless of the stepping direction.
 
     Returns (eye, w2c) if found, else (None, None).
     """
@@ -596,10 +611,14 @@ def try_adjust_camera(
         return None, None
     direction = direction / d_norm
 
+    floor_min = floor_y + min_height_above_floor
+
     for i in range(n_steps + 1):
         eye = eye_orig + direction * (i * step_size)
-        up = np.array([0.0, 1.0, 0.0])
-        w2c = look_at_matrix(eye, target, up)
+        if eye[up_idx] < floor_min:
+            eye[up_idx] = floor_min
+        world_up = np.zeros(3); world_up[up_idx] = 1.0
+        w2c = look_at_matrix(eye, target, world_up)
         if validate_camera(
             eye, target, mesh, scene_rc, inst_a, inst_b,
             w2c, K, width, height, min_proj_size,
@@ -796,16 +815,23 @@ def angular_separation(eye0: np.ndarray, eye1: np.ndarray, focus: np.ndarray) ->
     return float(math.degrees(math.acos(cos_a)))
 
 
-def detect_up_axis(axis_mat: np.ndarray) -> int:
+def detect_up_axis(axis_mat: np.ndarray, vertices: np.ndarray) -> int:
     """Detect which world axis (0=X,1=Y,2=Z) is 'up' after alignment.
 
-    ScanNet typically ends up Y-up after the axisAlignment transform.
-    We check which column of the rotation part has the largest dot with [0,1,0].
+    Strategy: the vertical axis (floor→ceiling) has the smallest coordinate
+    range in the aligned mesh, since rooms are typically wider than they are
+    tall.  Ties are broken by which row of the rotation matrix is most aligned
+    with a single standard-basis vector (i.e. is most "pure"), which catches
+    scenes where the room footprint is square.
     """
+    ranges = vertices.max(axis=0) - vertices.min(axis=0)
+    # Primary: smallest range = up axis
+    # Secondary (tie-break): row of R that is closest to a unit basis vector
     R = axis_mat[:3, :3]
-    world_y = np.array([0.0, 1.0, 0.0])
-    dots = np.abs(R.T @ world_y)
-    return int(np.argmax(dots))
+    row_purity = np.array([np.max(np.abs(R[i, :])) for i in range(3)])
+    # Combine: invert range (small range → large score), add purity as tie-break
+    score = -ranges + 0.01 * row_purity
+    return int(np.argmax(score))
 
 
 # ---------------------------------------------------------------------------
@@ -850,10 +876,8 @@ def process_scene(
 
     # Load axis alignment
     axis_mat = load_axis_alignment(txt_path)
-    up_axis = detect_up_axis(axis_mat)
-    log.info("Up axis after alignment: %d (0=X,1=Y,2=Z)", up_axis)
 
-    # Load mesh and instances
+    # Load mesh and instances (we need aligned vertices to detect up axis)
     mesh, instances = load_mesh_and_instances(
         ply_path, labels_ply_path, agg_path, segs_path,
         axis_mat, skip_labels, min_object_volume,
@@ -865,14 +889,21 @@ def process_scene(
 
     vertices = np.asarray(mesh.vertices)
 
-    # Floor height: Y-up means floor is minimum Y
-    if up_axis == 1:
-        floor_y = float(vertices[:, 1].min())
-    elif up_axis == 2:
-        floor_y = float(vertices[:, 2].min())
+    up_axis = detect_up_axis(axis_mat, vertices)
+    log.info("Up axis after alignment: %d (0=X,1=Y,2=Z)", up_axis)
+
+    # Floor height: use the 2nd percentile of the up-axis coordinate rather than
+    # the absolute minimum, which can be pulled down by stray vertices or mesh
+    # artifacts that sit below the actual floor surface.
+    up_idx = up_axis  # 0=X, 1=Y, 2=Z
+    floor_y = float(np.percentile(vertices[:, up_idx], 2))
+    log.info(
+        "Floor height (2nd-percentile of axis %d): %.3f m  "
+        "(abs min was %.3f m)",
+        up_idx, floor_y, float(vertices[:, up_idx].min()),
+    )
+    if up_axis == 2:
         log.warning("Z-up scene detected; camera height logic uses Z axis")
-    else:
-        floor_y = float(vertices[:, 1].min())
 
     # Camera intrinsics
     K = intrinsic_matrix(fov, width, height)
@@ -922,6 +953,7 @@ def process_scene(
         candidates = compute_camera_candidates(
             ca, cb, floor_y, camera_height,
             standoff_factor, standoff_min, standoff_max,
+            up_idx=up_axis,
         )
         if not candidates:
             continue
@@ -931,14 +963,16 @@ def process_scene(
         for cand in candidates:
             eye_cand = cand["eye"]
             tgt_cand = cand["target"]
-            up = np.array([0.0, 1.0, 0.0])
+            world_up = np.zeros(3); world_up[up_axis] = 1.0
 
-            w2c_cand = look_at_matrix(eye_cand, tgt_cand, up)
+            w2c_cand = look_at_matrix(eye_cand, tgt_cand, world_up)
 
             eye_final, w2c_final = try_adjust_camera(
                 eye_cand, tgt_cand, mesh, scene_rc,
                 inst_a, inst_b, K, width, height,
                 min_proj_size, occlusion_thresh, near_geom_dist, vertices,
+                floor_y=floor_y,
+                up_idx=up_axis,
             )
             if eye_final is None:
                 log.debug("Candidate %s invalid after adjustment", cand["label"])
@@ -1069,7 +1103,7 @@ def process_scene(
                     "image_path": f"images/{img_name}",
                     "camera_position_world": vp["eye"].tolist(),
                     "camera_look_at_world": vp["target"].tolist(),
-                    "camera_up": [0.0, 1.0, 0.0],
+                    "camera_up": [float(i == up_axis) for i in range(3)],
                     "camera_extrinsic_w2c": vp["w2c"].tolist(),
                     "camera_intrinsic": K.tolist(),
                     "fov_degrees": fov,
