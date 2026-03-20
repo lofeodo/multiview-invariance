@@ -857,6 +857,7 @@ def process_scene(
     occlusion_thresh: float,
     max_pairs: int,
     near_geom_dist: float,
+    full_colour: bool = False,
 ) -> None:
     """Process a single ScanNet scene directory."""
     scene_id = scene_dir.name
@@ -1042,8 +1043,10 @@ def process_scene(
             try:
                 rgb = render_scene(
                     mesh, vp["w2c"], K, width, height,
-                    inst_a=inst_a, inst_b=inst_b,
-                    color_a_rgb=color_rgb_a, color_b_rgb=color_rgb_b,
+                    inst_a=None if full_colour else inst_a,
+                    inst_b=None if full_colour else inst_b,
+                    color_a_rgb=None if full_colour else color_rgb_a,
+                    color_b_rgb=None if full_colour else color_rgb_b,
                 )
                 Image.fromarray(rgb).save(str(img_path))
                 Image.fromarray(rgb).save(str(vp_img_path))
@@ -1219,6 +1222,12 @@ def parse_args() -> argparse.Namespace:
         help="Space-separated list of object labels to skip. Overrides default list.",
     )
     p.add_argument("--near_geom_dist", type=float, default=DEFAULT_NEAR_GEOM_DIST)
+    p.add_argument(
+        "--full-colour",
+        action="store_true",
+        default=False,
+        help="Render in original scene colours without highlighting objects or converting to grayscale.",
+    )
     p.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     p.add_argument(
         "--log_level",
@@ -1251,6 +1260,7 @@ def main() -> None:
         occlusion_thresh=args.occlusion_ray_threshold,
         max_pairs=args.max_pairs_per_scene,
         near_geom_dist=args.near_geom_dist,
+        full_colour=args.full_colour,
     )
 
     scene_dir = Path(args.scene_dir)

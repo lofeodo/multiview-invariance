@@ -133,6 +133,7 @@ python generate_viewpoint_pairs.py --scene_dir scannet_data --batch
 | `--max_pairs_per_scene` | `20` | Cap on how many pairs to save per scene |
 | `--skip_labels` | *(see below)* | Space-separated object labels to ignore |
 | `--near_geom_dist` | `0.3` m | Camera is invalid if closer than this to any geometry |
+| `--full-colour` | off | Render in original scene colours; disables grayscale conversion and object highlighting |
 | `--seed` | `42` | Random seed (controls pair enumeration order) |
 | `--log_level` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 
@@ -164,7 +165,9 @@ outputs/
 
 ### Image format
 
-Rendered images show the scene in **grayscale** with the two target objects highlighted in **distinct colors** (e.g. object A in yellow, object B in blue). Colors are assigned per-pair from a rotating palette and recorded in the metadata.
+By default, rendered images show the scene in **grayscale** with the two target objects highlighted in **distinct colors** (e.g. object A in yellow, object B in blue). Colors are assigned per-pair from a rotating palette and recorded in the metadata.
+
+When `--full-colour` is passed, images are rendered in the original scene colors with no object highlighting or grayscale conversion.
 
 ### metadata.json structure
 
