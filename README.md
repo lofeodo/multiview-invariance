@@ -46,7 +46,7 @@ Each scene directory (e.g. `scannet_data/scene0000_00/`) contains:
 
 ### 1. `download_scenes.py` — Download ScanNet scenes
 
-Download specific scenes by ID or a range starting from scene 0.
+Download specific scenes by ID, a range starting from scene 0, or all scenes.
 
 ```bash
 # Download a specific set of scenes
@@ -54,6 +54,9 @@ python download_scenes.py --scenes 0 1 2
 
 # Download the first N scenes (scene0000_00 through scene000N-1_00)
 python download_scenes.py --upto 10
+
+# Download all scenes
+python download_scenes.py
 ```
 
 Files are saved to `./scannet_data/`.
@@ -73,20 +76,7 @@ Uses the vertex-colored mesh (`_vh_clean_2.ply`). Requires a display.
 
 ---
 
-### 3. `view_from_center.py` — View scene from scene center
-
-Opens the same interactive viewer but sets the camera to an eye-level position at the XY centroid of the scene, looking at the furniture centroid.
-
-```bash
-python view_from_center.py --scene 0
-python view_from_center.py --scene scene0000_00
-```
-
-Useful for a quick sanity-check of scene orientation. Requires a display.
-
----
-
-### 4. `generate_viewpoint_pairs.py` — Generate viewpoint pairs (main script)
+### 3. `generate_viewpoint_pairs.py` — Generate viewpoint pairs (main script)
 
 The main pipeline. For each scene it:
 
@@ -242,8 +232,10 @@ The `flipped_relations` list tells you which of these flipped across the viewpoi
 ## Typical workflow
 
 ```bash
-# 1. Download a few scenes
-python download_scenes.py --scenes 0 1 2
+# 1. Download scenes (specific, range, or all)
+python download_scenes.py --scenes 0 1 2  # specific
+python download_scenes.py --upto 10       # first 10
+python download_scenes.py                 # all
 
 # 2. (Optional) visually inspect one
 python view_scene.py --scene 0
