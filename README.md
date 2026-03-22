@@ -172,37 +172,27 @@ When `--full-colour` is passed, images are rendered in the original scene colors
         "instance_id": 3,
         "label": "chair",
         "color": "yellow",
-        "centroid_world": [x, y, z],
-        "bbox_min_world": [x, y, z],
-        "bbox_max_world": [x, y, z]
+        "color_rgb": [1.0, 0.85, 0.0]
       },
       "object_B": {
         "instance_id": 7,
         "label": "table",
         "color": "blue",
-        "centroid_world": [x, y, z],
-        "bbox_min_world": [x, y, z],
-        "bbox_max_world": [x, y, z]
+        "color_rgb": [0.15, 0.45, 1.0]
       },
       "viewpoints": [
         {
           "viewpoint_index": 0,
           "image_path": "images/objA_3_objB_7_view_0.png",
-          "camera_position_world": [x, y, z],
-          "camera_look_at_world": [x, y, z],
-          "camera_up": [0, 1, 0],
-          "camera_extrinsic_w2c": [[4x4 matrix]],
-          "camera_intrinsic": [[3x3 matrix]],
           "fov_degrees": 60,
           "image_resolution": [1024, 768],
-          "object_A_bbox_2d": [x1, y1, x2, y2],
-          "object_B_bbox_2d": [x1, y1, x2, y2],
-          "object_A_cam_coords": [x, y, z],
-          "object_B_cam_coords": [x, y, z],
           "spatial_relations": {
             "A_left_of_B": true,
+            "A_right_of_B": false,
             "A_in_front_of_B": false,
-            "A_above_B": false
+            "A_behind_B": true,
+            "A_above_B": false,
+            "A_below_B": false
           },
           "viewpoint_label": "perp_pos",
           "angular_sep_from_view0_deg": 0.0
@@ -217,13 +207,20 @@ When `--full-colour` is passed, images are rendered in the original scene colors
 
 ### Spatial relation conventions
 
-Camera space follows the **OpenCV convention**: x-right, y-down, z-forward into scene.
+Spatial relations reflect what is visible in the rendered image.
+
+Each axis is represented by a complementary pair. Both members of a pair cannot be true simultaneously, but both can be false when the objects are too close together along that axis (within the dead zone).
 
 | Field | Meaning when `true` |
 |---|---|
-| `A_left_of_B` | A's camera-x coordinate is less than B's (A is to the left in the image) |
-| `A_in_front_of_B` | A is closer to the camera than B (smaller z) |
-| `A_above_B` | A has a smaller camera-y than B (higher in the image) |
+| `A_left_of_B` | A appears more than 20 px to the left of B in the image |
+| `A_right_of_B` | A appears more than 20 px to the right of B in the image |
+| `A_in_front_of_B` | A is more than 0.1 m closer to the camera than B |
+| `A_behind_B` | A is more than 0.1 m further from the camera than B |
+| `A_above_B` | A appears more than 20 px above B in the image |
+| `A_below_B` | A appears more than 20 px below B in the image |
+
+Left/right and above/below use projected pixel coordinates (including perspective division), so they match what is visible in the rendered image even when objects are at different depths.
 
 The `flipped_relations` list tells you which of these flipped across the viewpoint pair, e.g. `["left_right"]` means view 0 has A-left-of-B and view 1 has A-right-of-B.
 

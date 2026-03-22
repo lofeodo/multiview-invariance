@@ -308,22 +308,38 @@ def compute_spatial_relations(
     centroid_a_world: np.ndarray,
     centroid_b_world: np.ndarray,
     w2c: np.ndarray,
+    K: np.ndarray,
+    px_threshold: float = 20.0,
+    depth_threshold: float = 0.1,
 ) -> dict:
-    """Compute spatial relations between A and B in camera space.
+    """Compute spatial relations between A and B as seen from the camera.
 
-    Camera space convention: x-right, y-down, z-forward.
-    - left/right: sign of (x_A - x_B)  — negative ⇒ A is left of B
-    - front/behind: sign of (z_A - z_B) — negative ⇒ A is in front of B
-    - above/below: sign of (y_A - y_B)  — negative ⇒ A is above B (y-down)
+    Left/right and above/below use projected pixel coordinates so they match
+    what is visually left/above in the rendered image (includes perspective
+    division). Front/behind uses camera-space z (depth).
+
+    Each axis has a dead zone: if the difference is smaller than the threshold,
+    neither direction is true (both can be false, but both cannot be true).
+
+    px_threshold    : pixel dead zone for left/right and above/below (default 20 px)
+    depth_threshold : metre dead zone for front/behind (default 0.1 m)
     """
     pts = world_to_cam(np.stack([centroid_a_world, centroid_b_world]), w2c)
     a_cam, b_cam = pts[0], pts[1]
+    uv, _ = project_points(np.stack([centroid_a_world, centroid_b_world]), w2c, K)
+    a_px, b_px = uv[0], uv[1]
+
+    dx = float(a_px[0] - b_px[0])
+    dy = float(a_px[1] - b_px[1])
+    dz = float(a_cam[2] - b_cam[2])
+
     return {
-        "A_left_of_B": bool(a_cam[0] < b_cam[0]),
-        "A_in_front_of_B": bool(a_cam[2] < b_cam[2]),
-        "A_above_B": bool(a_cam[1] < b_cam[1]),  # y-down ⇒ smaller y is higher
-        "_a_cam": a_cam.tolist(),
-        "_b_cam": b_cam.tolist(),
+        "A_left_of_B":     dx < -px_threshold,
+        "A_right_of_B":    dx >  px_threshold,
+        "A_in_front_of_B": dz < -depth_threshold,
+        "A_behind_B":      dz >  depth_threshold,
+        "A_above_B":       dy < -px_threshold,   # y-down: smaller pixel-y is higher
+        "A_below_B":       dy >  px_threshold,
     }
 
 
@@ -994,7 +1010,7 @@ def process_scene(
 
         # Compute spatial relations for all valid viewpoints
         rels = [
-            compute_spatial_relations(ca, cb, vp["w2c"])
+            compute_spatial_relations(ca, cb, vp["w2c"], K)
             for vp in valid_viewpoints
         ]
 
@@ -1002,10 +1018,10 @@ def process_scene(
         flipped: list[str] = []
         r0 = rels[0]
         for ri in rels[1:]:
-            if ri["A_left_of_B"] != r0["A_left_of_B"]:
+            if ri["A_left_of_B"] != r0["A_left_of_B"] or ri["A_right_of_B"] != r0["A_right_of_B"]:
                 if "left_right" not in flipped:
                     flipped.append("left_right")
-            if ri["A_in_front_of_B"] != r0["A_in_front_of_B"]:
+            if ri["A_in_front_of_B"] != r0["A_in_front_of_B"] or ri["A_behind_B"] != r0["A_behind_B"]:
                 if "front_behind" not in flipped:
                     flipped.append("front_behind")
 
@@ -1096,26 +1112,13 @@ def process_scene(
                     (ca + cb) / 2.0,
                 )
 
-            rel_clean = {k: v for k, v in rel.items() if not k.startswith("_")}
-            a_cam = rel["_a_cam"]
-            b_cam = rel["_b_cam"]
-
             viewpoint_records.append(
                 {
                     "viewpoint_index": vi,
                     "image_path": f"images/{img_name}",
-                    "camera_position_world": vp["eye"].tolist(),
-                    "camera_look_at_world": vp["target"].tolist(),
-                    "camera_up": [float(i == up_axis) for i in range(3)],
-                    "camera_extrinsic_w2c": vp["w2c"].tolist(),
-                    "camera_intrinsic": K.tolist(),
                     "fov_degrees": fov,
                     "image_resolution": [width, height],
-                    "object_A_bbox_2d": bbox_a,
-                    "object_B_bbox_2d": bbox_b,
-                    "object_A_cam_coords": a_cam,
-                    "object_B_cam_coords": b_cam,
-                    "spatial_relations": rel_clean,
+                    "spatial_relations": rel,
                     "viewpoint_label": vp["label"],
                     "angular_sep_from_view0_deg": round(ang_sep, 2),
                 }
@@ -1137,18 +1140,12 @@ def process_scene(
                 "label": inst_a["label"],
                 "color": color_name_a,
                 "color_rgb": [round(float(v), 3) for v in color_rgb_a],
-                "centroid_world": ca.tolist(),
-                "bbox_min_world": inst_a["bbox_min"].tolist(),
-                "bbox_max_world": inst_a["bbox_max"].tolist(),
             },
             "object_B": {
                 "instance_id": inst_b["instance_id"],
                 "label": inst_b["label"],
                 "color": color_name_b,
                 "color_rgb": [round(float(v), 3) for v in color_rgb_b],
-                "centroid_world": cb.tolist(),
-                "bbox_min_world": inst_b["bbox_min"].tolist(),
-                "bbox_max_world": inst_b["bbox_max"].tolist(),
             },
             "viewpoints": viewpoint_records,
             "flipped_relations": flipped,
