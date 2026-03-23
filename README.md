@@ -6,6 +6,15 @@ The core idea: given a reconstructed 3D scene, analytically find camera placemen
 
 ---
 
+## Quick start
+
+```bash
+python download_scenes.py --scenes 0
+python generate_viewpoint_pairs.py --scene_dir scannet_data/scene0000_00 --fov 60 --resolution_w 1024 --resolution_h 768 --max_pairs_per_scene 6 --min_object_volume 0.2
+```
+
+---
+
 ## Setup
 
 ### Requirements
