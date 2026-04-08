@@ -88,16 +88,19 @@ HIGHLIGHT_PALETTE: list[tuple[str, np.ndarray]] = [
 ]
 
 
-def assign_pair_colors(pair_index: int) -> tuple[str, np.ndarray, str, np.ndarray]:
-    """Return (name_a, rgb_a, name_b, rgb_b) for a given pair index.
+def assign_pair_colors(
+    pair_index: int,
+) -> tuple[str, np.ndarray, str, np.ndarray, str, np.ndarray]:
+    """Return (name_a, rgb_a, name_b, rgb_b, name_arrow, rgb_arrow) for a given pair index.
 
-    Even-indexed palette entries go to A, odd to B, cycling through the palette
-    so consecutive pairs always get different colours from one another.
+    Entries are drawn from HIGHLIGHT_PALETTE at offsets 0, 1, 2 (mod n) relative
+    to the pair's base index, so A, B, and the arrow are always distinct colours.
     """
     n = len(HIGHLIGHT_PALETTE)
-    name_a, rgb_a = HIGHLIGHT_PALETTE[(pair_index * 2) % n]
-    name_b, rgb_b = HIGHLIGHT_PALETTE[(pair_index * 2 + 1) % n]
-    return name_a, rgb_a.copy(), name_b, rgb_b.copy()
+    name_a, rgb_a       = HIGHLIGHT_PALETTE[(pair_index * 2)     % n]
+    name_b, rgb_b       = HIGHLIGHT_PALETTE[(pair_index * 2 + 1) % n]
+    name_sp, rgb_sp     = HIGHLIGHT_PALETTE[(pair_index * 2 + 2) % n]
+    return name_a, rgb_a.copy(), name_b, rgb_b.copy(), name_sp, rgb_sp.copy()
 
 
 # ---------------------------------------------------------------------------
@@ -734,8 +737,22 @@ def _o3d_mesh_to_pyvista(mesh: o3d.geometry.TriangleMesh, override_colors: np.nd
     return pv_mesh
 
 
-def _pyvista_render(pv_mesh, w2c: np.ndarray, K: np.ndarray, width: int, height: int) -> np.ndarray:
-    """Render a PyVista mesh with the given camera and return (H, W, 3) uint8."""
+def _pyvista_render(
+    pv_mesh,
+    w2c: np.ndarray,
+    K: np.ndarray,
+    width: int,
+    height: int,
+    sphere_center: np.ndarray | None = None,
+    sphere_color: np.ndarray | None = None,
+    arrow_target: np.ndarray | None = None,
+) -> np.ndarray:
+    """Render a PyVista mesh with the given camera and return (H, W, 3) uint8.
+
+    If sphere_center and arrow_target are provided, an arrow is drawn at sphere_center
+    pointing towards arrow_target (the midpoint between the two highlighted object centroids),
+    coloured with sphere_color (float RGB in [0, 1]).
+    """
     import pyvista as pv
 
     position, focal_point, up_world, view_angle = _w2c_to_pyvista_camera(w2c, K, height)
@@ -743,6 +760,21 @@ def _pyvista_render(pv_mesh, w2c: np.ndarray, K: np.ndarray, width: int, height:
     plotter = pv.Plotter(off_screen=True, window_size=[width, height])
     plotter.set_background("black")
     plotter.add_mesh(pv_mesh, scalars="RGB", rgb=True, show_scalar_bar=False)
+
+    if sphere_center is not None and arrow_target is not None:
+        direction = arrow_target - sphere_center
+        length = float(np.linalg.norm(direction))
+        if length > 1e-6:
+            direction_unit = direction / length
+            arrow = pv.Arrow(
+                start=sphere_center.tolist(),
+                direction=direction_unit.tolist(),
+                scale=min(length, 0.5),
+                tip_length=0.25,
+                tip_radius=0.1,
+                shaft_radius=0.04,
+            )
+            plotter.add_mesh(arrow, color=np.clip(sphere_color, 0.0, 1.0).tolist())
 
     plotter.camera.position = position.tolist()
     plotter.camera.focal_point = focal_point.tolist()
@@ -767,12 +799,19 @@ def render_scene(
     inst_b: dict | None = None,
     color_a_rgb: np.ndarray | None = None,
     color_b_rgb: np.ndarray | None = None,
+    sphere_center: np.ndarray | None = None,
+    sphere_color: np.ndarray | None = None,
+    arrow_target: np.ndarray | None = None,
 ) -> np.ndarray:
     """Render the scene using PyVista (VTK-based, Windows headless compatible).
 
     When inst_a/inst_b and their colours are supplied, object A and B are
     rendered in their assigned highlight colours; everything else is converted
     to perceptual grayscale.
+
+    When sphere_center and arrow_target are provided, an arrow is rendered at
+    sphere_center pointing towards arrow_target (midpoint between object centroids),
+    using sphere_color (float RGB in [0, 1]).
 
     Returns (H, W, 3) uint8 RGB array.
     """
@@ -781,7 +820,7 @@ def render_scene(
         pv_mesh = _o3d_mesh_to_pyvista(mesh, override_colors=override)
     else:
         pv_mesh = _o3d_mesh_to_pyvista(mesh)
-    return _pyvista_render(pv_mesh, w2c, K, width, height)
+    return _pyvista_render(pv_mesh, w2c, K, width, height, sphere_center=sphere_center, sphere_color=sphere_color, arrow_target=arrow_target)
 
 
 def render_instance_mask(
@@ -851,6 +890,94 @@ def detect_up_axis(axis_mat: np.ndarray, vertices: np.ndarray) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Sphere placement
+# ---------------------------------------------------------------------------
+
+def _point_visible_from(
+    scene_rc: o3d.t.geometry.RaycastingScene,
+    eye: np.ndarray,
+    target: np.ndarray,
+    tolerance: float = 0.05,
+) -> bool:
+    """Return True if no mesh geometry blocks the ray from eye to target.
+
+    Unlike check_occlusion (which expects the ray to *hit* a mesh surface),
+    this checks that nothing intersects the ray *before* it reaches the target
+    point in open space.
+    """
+    direction = target - eye
+    dist = float(np.linalg.norm(direction))
+    if dist < 1e-6:
+        return True
+    direction = (direction / dist).astype(np.float32)
+
+    ray = o3d.core.Tensor(
+        np.hstack([eye.astype(np.float32), direction])[None, :],
+        dtype=o3d.core.Dtype.Float32,
+    )
+    hit_dist = float(scene_rc.cast_rays(ray)["t_hit"].numpy()[0])
+    return hit_dist >= dist - tolerance
+
+
+def find_sphere_position(
+    scene_rc: o3d.t.geometry.RaycastingScene,
+    viewpoints: list[dict],  # each dict has "eye" (np.ndarray) and "w2c" (4×4 np.ndarray)
+    vertices: np.ndarray,
+    floor_y: float,
+    up_idx: int,
+    sphere_radius: float = 0.1,
+    n_candidates: int = 200,
+) -> np.ndarray | None:
+    """Sample a random world position that satisfies all three constraints:
+
+    1. In front of every camera  (positive camera-space z, so it renders).
+    2. Unoccluded from every camera eye  (no mesh surface blocks the ray).
+    3. Not clipping into mesh geometry  (nearest surface >= sphere_radius).
+
+    Candidates are drawn uniformly from the 10th–90th-percentile bounding box
+    of the scene in the ground plane at a fixed height above the floor.
+
+    Returns the first valid position, or None if no candidate passes.
+    """
+    ground_axes = [a for a in (0, 1, 2) if a != up_idx]
+    h0, h1 = ground_axes
+
+    lo0 = float(np.percentile(vertices[:, h0], 10))
+    hi0 = float(np.percentile(vertices[:, h0], 90))
+    lo1 = float(np.percentile(vertices[:, h1], 10))
+    hi1 = float(np.percentile(vertices[:, h1], 90))
+
+    sphere_height = floor_y + 0.7  # 0.7 m above floor — clear of floor mesh, below camera
+
+    for _ in range(n_candidates):
+        pos = np.zeros(3)
+        pos[h0]     = np.random.uniform(lo0, hi0)
+        pos[h1]     = np.random.uniform(lo1, hi1)
+        pos[up_idx] = sphere_height
+
+        # 1. Not clipping into mesh geometry
+        if nearest_geometry_distance(scene_rc, pos) < sphere_radius:
+            continue
+
+        # 2. In front of every camera AND unoccluded
+        valid = True
+        for vp in viewpoints:
+            eye     = vp["eye"]
+            forward = vp["w2c"][2, :3]  # camera z-axis in world space (OpenCV: z-forward = row 2 of R)
+            if float(np.dot(pos - eye, forward)) <= 0.0:
+                valid = False
+                break
+            if not _point_visible_from(scene_rc, eye, pos):
+                valid = False
+                break
+
+        if valid:
+            return pos
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Main scene processing
 # ---------------------------------------------------------------------------
 
@@ -874,6 +1001,7 @@ def process_scene(
     max_pairs: int,
     near_geom_dist: float,
     full_colour: bool = False,
+    reference_object: bool = False,
 ) -> None:
     """Process a single ScanNet scene directory."""
     scene_id = scene_dir.name
@@ -963,8 +1091,8 @@ def process_scene(
             pair_id, inst_a["label"], inst_b["label"], dist,
         )
 
-        # Assign highlight colours for this pair
-        color_name_a, color_rgb_a, color_name_b, color_rgb_b = assign_pair_colors(pair_color_index)
+        # Assign highlight colours for this pair (A, B, and optional sphere)
+        color_name_a, color_rgb_a, color_name_b, color_rgb_b, color_name_sp, color_rgb_sp = assign_pair_colors(pair_color_index)
 
         # Compute candidate camera positions
         candidates = compute_camera_candidates(
@@ -1047,6 +1175,54 @@ def process_scene(
         if len(selected_vps) < 2:
             continue
 
+        # Find a single sphere position visible from all viewpoints (once per pair)
+        sphere_pos: np.ndarray | None = None
+        if reference_object:
+            sphere_pos = find_sphere_position(
+                scene_rc,
+                selected_vps,
+                vertices,
+                floor_y,
+                up_axis,
+            )
+            if sphere_pos is None:
+                # Fallback: midpoint of the two objects at fixed height.
+                # Every camera looks at this midpoint, so it is always in front.
+                sphere_pos = ((ca + cb) / 2.0).copy()
+                sphere_pos[up_axis] = floor_y + 0.7
+                log.warning(
+                    "  No valid sphere position found for pair %s — falling back to pair midpoint",
+                    pair_id,
+                )
+
+            # Re-filter: only keep viewpoints where the sphere is also visible.
+            # Uses the same criteria as find_sphere_position (in-front + unoccluded).
+            sphere_filtered = [
+                (vp, rel) for vp, rel in zip(selected_vps, selected_rels)
+                if float(np.dot(sphere_pos - vp["eye"], vp["w2c"][2, :3])) > 0
+                and _point_visible_from(scene_rc, vp["eye"], sphere_pos)
+            ]
+            if len(sphere_filtered) < 2:
+                log.info("  Pair %s: fewer than 2 viewpoints can see the sphere — skipping pair", pair_id)
+                continue
+            selected_vps, selected_rels = zip(*sphere_filtered)
+            selected_vps  = list(selected_vps)
+            selected_rels = list(selected_rels)
+
+            # Re-check that a relation flip still holds among the surviving viewpoints
+            flipped = []
+            r0 = selected_rels[0]
+            for ri in selected_rels[1:]:
+                if ri["A_left_of_B"] != r0["A_left_of_B"] or ri["A_right_of_B"] != r0["A_right_of_B"]:
+                    if "left_right" not in flipped:
+                        flipped.append("left_right")
+                if ri["A_in_front_of_B"] != r0["A_in_front_of_B"] or ri["A_behind_B"] != r0["A_behind_B"]:
+                    if "front_behind" not in flipped:
+                        flipped.append("front_behind")
+            if not flipped:
+                log.info("  Pair %s: sphere filtering removed the flip — skipping pair", pair_id)
+                continue
+
         # Render images and compute 2D bboxes
         viewpoint_records: list[dict] = []
         any_render_failed = False
@@ -1063,6 +1239,9 @@ def process_scene(
                     inst_b=None if full_colour else inst_b,
                     color_a_rgb=None if full_colour else color_rgb_a,
                     color_b_rgb=None if full_colour else color_rgb_b,
+                    sphere_center=sphere_pos,
+                    sphere_color=color_rgb_sp if sphere_pos is not None else None,
+                    arrow_target=(ca + cb) / 2.0 if sphere_pos is not None else None,
                 )
                 Image.fromarray(rgb).save(str(img_path))
                 Image.fromarray(rgb).save(str(vp_img_path))
@@ -1147,6 +1326,12 @@ def process_scene(
                 "color": color_name_b,
                 "color_rgb": [round(float(v), 3) for v in color_rgb_b],
             },
+            **({"reference_object_arrow": {
+                "color": color_name_sp,
+                "color_rgb": [round(float(v), 3) for v in color_rgb_sp],
+                "position_world": [round(float(v), 4) for v in sphere_pos] if sphere_pos is not None else None,
+                "target_world": [round(float(v), 4) for v in ((ca + cb) / 2.0)] if sphere_pos is not None else None,
+            }} if reference_object else {}),
             "viewpoints": viewpoint_records,
             "flipped_relations": flipped,
             "viewpoint_angular_separation_degrees": round(overall_ang, 2),
@@ -1225,6 +1410,12 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Render in original scene colours without highlighting objects or converting to grayscale.",
     )
+    p.add_argument(
+        "--reference-object",
+        action="store_true",
+        default=False,
+        help="Add a small coloured sphere at a randomly chosen position visible from all viewpoints.",
+    )
     p.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     p.add_argument(
         "--log_level",
@@ -1258,6 +1449,7 @@ def main() -> None:
         max_pairs=args.max_pairs_per_scene,
         near_geom_dist=args.near_geom_dist,
         full_colour=args.full_colour,
+        reference_object=args.reference_object,
     )
 
     scene_dir = Path(args.scene_dir)
