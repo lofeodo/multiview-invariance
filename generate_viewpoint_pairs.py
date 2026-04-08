@@ -981,6 +981,7 @@ def find_arrow_position(
     width: int,
     height: int,
     occlusion_thresh: float,
+    min_proj_size: int,
     arrow_radius: float = 0.08,
     arrow_height_above_floor: float = 0.7,
     n_random: int = 300,
@@ -1093,6 +1094,19 @@ def find_arrow_position(
         if _point_inside_any_instance(pos, instances):
             continue
 
+        # Both highlighted objects must be sufficiently visible from the arrow's
+        # own pose (same occlusion + frustum checks as validate_camera).
+        world_up_vec = np.zeros(3); world_up_vec[up_idx] = 1.0
+        w2c_cand = look_at_matrix(pos, arrow_target, world_up_vec)
+        if check_occlusion(scene_rc, pos, vertices[inst_a["vertex_indices"]], occlusion_thresh) < occlusion_thresh:
+            continue
+        if check_occlusion(scene_rc, pos, vertices[inst_b["vertex_indices"]], occlusion_thresh) < occlusion_thresh:
+            continue
+        if not objects_in_frustum(inst_a["centroid"], inst_a["bbox_min"], inst_a["bbox_max"], w2c_cand, K, width, height, min_proj_size):
+            continue
+        if not objects_in_frustum(inst_b["centroid"], inst_b["bbox_min"], inst_b["bbox_max"], w2c_cand, K, width, height, min_proj_size):
+            continue
+
         visible_vps:  list[dict] = []
         visible_rels: list[dict] = []
         for vp, rel in zip(viewpoints, rels):
@@ -1134,6 +1148,7 @@ def process_scene(
     near_geom_dist: float,
     full_colour: bool = False,
     reference_object: bool = False,
+    print_reference_image: bool = False,
 ) -> None:
     """Process a single ScanNet scene directory."""
     scene_id = scene_dir.name
@@ -1316,7 +1331,7 @@ def process_scene(
             sphere_pos, arrow_vps, arrow_rels = find_arrow_position(
                 scene_rc, selected_vps, selected_rels, ca, cb,
                 inst_a, inst_b, instances,
-                floor_y, up_axis, vertices, K, width, height, occlusion_thresh,
+                floor_y, up_axis, vertices, K, width, height, occlusion_thresh, min_proj_size,
             )
             if sphere_pos is None:
                 log.info(
@@ -1341,6 +1356,61 @@ def process_scene(
             if not flipped:
                 log.info("  Pair %s: arrow-visibility filtering removed the flip — skipping pair", pair_id)
                 continue
+
+        # Arrow-perspective spatial relations and optional reference image
+        arrow_target_pos: np.ndarray | None = None
+        arrow_spatial_rels: dict | None = None
+        arrow_image_path: str | None = None
+        arrow_pose: dict | None = None
+        if sphere_pos is not None:
+            arrow_target_pos = (ca + cb) / 2.0
+            world_up = np.zeros(3); world_up[up_axis] = 1.0
+            w2c_arrow = look_at_matrix(sphere_pos, arrow_target_pos, world_up)
+            arrow_spatial_rels = compute_spatial_relations(ca, cb, w2c_arrow, K)
+
+            # Pose description: position, forward/right/up axes, and the world-up
+            # convention used (camera up = world up = floor normal).
+            forward_vec = (arrow_target_pos - sphere_pos)
+            forward_vec = forward_vec / np.linalg.norm(forward_vec)
+            right_vec   = np.cross(forward_vec, world_up)
+            right_norm  = np.linalg.norm(right_vec)
+            if right_norm > 1e-6:
+                right_vec = right_vec / right_norm
+            else:
+                # Degenerate case: arrow points straight up/down — fall back to x-axis
+                right_vec = np.array([1.0, 0.0, 0.0])
+                right_vec[up_axis] = 0.0
+                right_vec = right_vec / np.linalg.norm(right_vec)
+            up_vec = np.cross(right_vec, forward_vec)
+
+            arrow_pose = {
+                "position_world":  [round(float(v), 4) for v in sphere_pos],
+                "forward_world":   [round(float(v), 4) for v in forward_vec],
+                "right_world":     [round(float(v), 4) for v in right_vec],
+                "up_world":        [round(float(v), 4) for v in up_vec],
+                "up_convention":   "world_up — camera up-axis is aligned with the floor normal (axis %d)" % up_axis,
+                "w2c_matrix":      [[round(float(v), 6) for v in row] for row in w2c_arrow.tolist()],
+                "fov_degrees":     fov,
+                "image_resolution": [width, height],
+            }
+
+            if print_reference_image:
+                arrow_img_name = f"objA_{inst_a['instance_id']}_objB_{inst_b['instance_id']}_view_arrow.png"
+                arrow_img_path = img_dir / arrow_img_name
+                arrow_vp_path  = vp_dir  / arrow_img_name
+                try:
+                    rgb_arrow = render_scene(
+                        mesh, w2c_arrow, K, width, height,
+                        inst_a=None if full_colour else inst_a,
+                        inst_b=None if full_colour else inst_b,
+                        color_a_rgb=None if full_colour else color_rgb_a,
+                        color_b_rgb=None if full_colour else color_rgb_b,
+                    )
+                    Image.fromarray(rgb_arrow).save(str(arrow_img_path))
+                    Image.fromarray(rgb_arrow).save(str(arrow_vp_path))
+                    arrow_image_path = f"images/{arrow_img_name}"
+                except Exception as exc:
+                    log.warning("  Arrow-view render failed: %s", exc)
 
         # Render images and compute 2D bboxes
         viewpoint_records: list[dict] = []
@@ -1448,8 +1518,9 @@ def process_scene(
             **({"reference_object_arrow": {
                 "color": color_name_sp,
                 "color_rgb": [round(float(v), 3) for v in color_rgb_sp],
-                "position_world": [round(float(v), 4) for v in sphere_pos] if sphere_pos is not None else None,
-                "target_world": [round(float(v), 4) for v in ((ca + cb) / 2.0)] if sphere_pos is not None else None,
+                "pose": arrow_pose,
+                "spatial_relations_from_arrow": arrow_spatial_rels,
+                **({"image_path": arrow_image_path} if arrow_image_path is not None else {}),
             }} if reference_object else {}),
             "viewpoints": viewpoint_records,
             "flipped_relations": flipped,
@@ -1535,6 +1606,12 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Add a coloured arrow pointing toward the midpoint between the two highlighted objects, placed at a position visible from at least 2 viewpoints.",
     )
+    p.add_argument(
+        "--print-reference-image",
+        action="store_true",
+        default=False,
+        help="Render an additional image from the arrow's viewpoint and save it as objA_x_objB_y_view_arrow.png. Requires --reference-object.",
+    )
     p.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     p.add_argument(
         "--log_level",
@@ -1569,6 +1646,7 @@ def main() -> None:
         near_geom_dist=args.near_geom_dist,
         full_colour=args.full_colour,
         reference_object=args.reference_object,
+        print_reference_image=args.print_reference_image,
     )
 
     scene_dir = Path(args.scene_dir)
