@@ -4,13 +4,19 @@ A toolkit for evaluating **VLM cross-viewpoint spatial reasoning invariance** us
 
 The core idea: given a reconstructed 3D scene, analytically find camera placements where the apparent spatial relation between two objects (e.g. "A is left of B") flips between viewpoints. Rendered image pairs/triplets are then used to probe whether vision-language models give consistent spatial relation judgments across viewpoints.
 
+An optional **reference arrow** can be placed in the scene pointing toward the midpoint between the two highlighted objects, serving as an unambiguous spatial anchor for the pair. The arrow's own viewpoint is recorded and can be rendered as an additional image.
+
 ---
 
 ## Quick start
 
 ```bash
 python download_scenes.py --scenes 0
-python generate_viewpoint_pairs.py --scene_dir scannet_data/scene0000_00 --fov 60 --resolution_w 1024 --resolution_h 768 --max_pairs_per_scene 6 --min_object_volume 0.2
+python generate_viewpoint_pairs.py \
+    --scene_dir scannet_data/scene0000_00 \
+    --fov 60 --resolution_w 1024 --resolution_h 768 \
+    --max_pairs_per_scene 6 --min_object_volume 0.2 \
+    --reference-object --print-reference-image
 ```
 
 ---
@@ -90,13 +96,15 @@ Uses the vertex-colored mesh (`_vh_clean_2.ply`). Requires a display.
 The main pipeline. For each scene it:
 
 1. Loads the mesh and instance annotations
-2. Applies the axis-alignment matrix (so Y is up, floor is XZ plane)
+2. Applies the axis-alignment matrix so the floor is flat and the up axis is detected automatically
 3. Filters out structural elements (walls, floor, ceiling, etc.) and tiny objects
 4. Enumerates all object pairs within a configurable distance range
-5. Analytically places cameras on opposite sides of the "flip plane" for each pair
-6. Validates each camera (checks for geometry collisions, occlusion, frustum coverage, projected size)
-7. Renders images with the two target objects highlighted in distinct colors against a grayscale background
-8. Saves rendered images and a full metadata JSON
+5. Finds candidate viewpoints for each pair irrespective of any arrow position
+6. For each pair, searches for a valid arrow position (visible from ≥ 2 viewpoints, not occluded, not embedded in geometry, at a safe minimum distance from each highlighted object)
+7. If no valid arrow position is found, the pair is skipped
+8. Validates each camera (geometry proximity, per-object occlusion, frustum coverage, projected size)
+9. Renders images with the two target objects highlighted in distinct colors against a grayscale background, with the reference arrow drawn as a flat indicator pointing toward the pair midpoint
+10. Saves rendered images and a full metadata JSON
 
 #### Single scene
 
@@ -133,6 +141,9 @@ python generate_viewpoint_pairs.py --scene_dir scannet_data --batch
 | `--skip_labels` | *(see below)* | Space-separated object labels to ignore |
 | `--near_geom_dist` | `0.3` m | Camera is invalid if closer than this to any geometry |
 | `--full-colour` | off | Render in original scene colours; disables grayscale conversion and object highlighting |
+| `--reference-object` | off | Place a coloured arrow in each scene pointing toward the midpoint between the two highlighted objects |
+| `--print-reference-image` | off | Render an extra image from the arrow's own viewpoint and save it as `objA_x_objB_y_view_arrow.png`. Requires `--reference-object` |
+| `--max-arrow-occlusion` | `0.8` | Minimum fraction of arrow sample rays that must reach the arrow unblocked from a viewpoint (0–1). Used to determine whether the arrow is visible from each camera |
 | `--seed` | `42` | Random seed (controls pair enumeration order) |
 | `--log_level` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 
@@ -146,27 +157,56 @@ python generate_viewpoint_pairs.py --scene_dir scannet_data/scene0000_00 \
 
 ---
 
+## Reference arrow
+
+When `--reference-object` is passed, the pipeline places a flat coloured arrow in each accepted scene. The arrow:
+
+- Points toward the midpoint between the two highlighted objects' centroids
+- Is rendered as a flat indicator lying in the horizontal plane (flat face perpendicular to the world up axis, so a horizontal arrow looks like a flat road sign)
+- Is placed at a fixed height above the floor (`0.7 m` by default)
+- Must be visible (≥ `--max-arrow-occlusion`, default 80%) from at least 2 of the selected viewpoints, verified via open-space raycasting from each camera to sample points along the arrow shaft
+- Must not be embedded inside any scene object (AABB check) or clipping into the scene mesh
+- Must be at a safe minimum distance from each highlighted object: the arrow centroid must be at least as far from object X's centroid as the longest bounding-box dimension of object X (checked for both A and B)
+- Both highlighted objects must also be sufficiently visible from the arrow's own camera pose, checked with the same raycasting occlusion logic used for regular viewpoints
+
+The arrow's camera pose is defined as:
+
+| Axis | Direction |
+|---|---|
+| Forward | Arrow position → pair midpoint |
+| Up | World up (floor normal) |
+| Right | Cross(forward, up) |
+
+If `--print-reference-image` is also passed, an image is rendered from this pose (without the arrow itself, to avoid being inside it) and saved alongside the viewpoint images.
+
+Object pairs for which no valid arrow position can be found are skipped entirely.
+
+---
+
 ## Outputs
 
 ```
 outputs/
 ├── scene0000_00/
 │   ├── images/
-│   │   ├── objA_3_objB_7_view_0.png   # viewpoint 0
-│   │   ├── objA_3_objB_7_view_1.png   # viewpoint 1 (relation flipped)
-│   │   ├── objA_3_objB_7_view_2.png   # optional diagonal viewpoint
+│   │   ├── objA_3_objB_7_view_0.png          # viewpoint 0
+│   │   ├── objA_3_objB_7_view_1.png          # viewpoint 1 (relation flipped)
+│   │   ├── objA_3_objB_7_view_2.png          # optional diagonal viewpoint
+│   │   ├── objA_3_objB_7_view_arrow.png      # arrow viewpoint (--print-reference-image)
 │   │   └── ...
 │   └── metadata.json
 └── viewpoints/
     └── scene0000_00/
-        └── ...                         # same images, mirrored here
+        └── ...                               # same images, mirrored here
 ```
 
 ### Image format
 
-By default, rendered images show the scene in **grayscale** with the two target objects highlighted in **distinct colors** (e.g. object A in yellow, object B in blue). Colors are assigned per-pair from a rotating palette and recorded in the metadata.
+By default, rendered images show the scene in **grayscale** with the two target objects highlighted in **distinct colors** (e.g. object A in yellow, object B in blue). A coloured arrow (e.g. orange) is overlaid when `--reference-object` is active. Colors are assigned per-pair from a rotating palette and recorded in the metadata.
 
 When `--full-colour` is passed, images are rendered in the original scene colors with no object highlighting or grayscale conversion.
+
+The arrow-view image (`_view_arrow.png`) does **not** include the arrow itself, so both highlighted objects are fully visible from the arrow's perspective.
 
 ### metadata.json structure
 
@@ -174,6 +214,8 @@ When `--full-colour` is passed, images are rendered in the original scene colors
 {
   "scene_id": "scene0000_00",
   "axis_alignment_applied": true,
+  "up_axis": "Y",
+  "camera_conventions": "OpenCV (x-right, y-down, z-forward)",
   "viewpoint_groups": [
     {
       "pair_id": "3_7",
@@ -188,6 +230,29 @@ When `--full-colour` is passed, images are rendered in the original scene colors
         "label": "table",
         "color": "blue",
         "color_rgb": [0.15, 0.45, 1.0]
+      },
+      "reference_object_arrow": {
+        "color": "orange",
+        "color_rgb": [1.0, 0.5, 0.0],
+        "pose": {
+          "position_world": [-0.50, 1.69, 0.67],
+          "forward_world":  [0.82, -0.12, 0.56],
+          "right_world":    [0.57,  0.00, -0.82],
+          "up_world":       [0.10,  0.99,  0.07],
+          "up_convention":  "world_up — camera up-axis is aligned with the floor normal (axis 1)",
+          "w2c_matrix":     [["...4x4 row-major OpenCV extrinsic matrix..."]],
+          "fov_degrees":    60.0,
+          "image_resolution": [1024, 768]
+        },
+        "spatial_relations_from_arrow": {
+          "A_left_of_B": false,
+          "A_right_of_B": true,
+          "A_in_front_of_B": true,
+          "A_behind_B": false,
+          "A_above_B": false,
+          "A_below_B": false
+        },
+        "image_path": "images/objA_3_objB_7_view_arrow.png"
       },
       "viewpoints": [
         {
@@ -214,6 +279,8 @@ When `--full-colour` is passed, images are rendered in the original scene colors
 }
 ```
 
+The `reference_object_arrow` block is only present when `--reference-object` is used. The `image_path` inside it is only present when `--print-reference-image` is also used.
+
 ### Spatial relation conventions
 
 Spatial relations reflect what is visible in the rendered image.
@@ -233,6 +300,8 @@ Left/right and above/below use projected pixel coordinates (including perspectiv
 
 The `flipped_relations` list tells you which of these flipped across the viewpoint pair, e.g. `["left_right"]` means view 0 has A-left-of-B and view 1 has A-right-of-B.
 
+Spatial relations in `spatial_relations_from_arrow` follow the same conventions but are computed from the arrow's camera pose rather than from any of the regular viewpoints.
+
 ---
 
 ## Typical workflow
@@ -246,9 +315,14 @@ python download_scenes.py                 # all
 # 2. (Optional) visually inspect one
 python view_scene.py --scene 0
 
-# 3. Generate viewpoint pairs
-python generate_viewpoint_pairs.py --scene_dir scannet_data/scene0000_00
+# 3. Generate viewpoint pairs with reference arrows
+python generate_viewpoint_pairs.py \
+    --scene_dir scannet_data/scene0000_00 \
+    --reference-object --print-reference-image
 
 # 4. Batch-process everything downloaded
-python generate_viewpoint_pairs.py --scene_dir scannet_data --batch --max_pairs_per_scene 30
+python generate_viewpoint_pairs.py \
+    --scene_dir scannet_data --batch \
+    --max_pairs_per_scene 30 \
+    --reference-object --print-reference-image
 ```
