@@ -890,91 +890,223 @@ def detect_up_axis(axis_mat: np.ndarray, vertices: np.ndarray) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Sphere placement
+# Arrow placement
 # ---------------------------------------------------------------------------
 
-def _point_visible_from(
-    scene_rc: o3d.t.geometry.RaycastingScene,
-    eye: np.ndarray,
-    target: np.ndarray,
-    tolerance: float = 0.05,
+def _point_inside_any_instance(
+    pos: np.ndarray,
+    instances: list[dict],
+    margin: float = 0.05,
 ) -> bool:
-    """Return True if no mesh geometry blocks the ray from eye to target.
+    """Return True if pos falls inside the axis-aligned bounding box of any instance.
 
-    Unlike check_occlusion (which expects the ray to *hit* a mesh surface),
-    this checks that nothing intersects the ray *before* it reaches the target
-    point in open space.
+    A small margin is added to each bbox to catch points that are on or just
+    outside a surface but would still cause the arrow to appear embedded.
     """
-    direction = target - eye
-    dist = float(np.linalg.norm(direction))
-    if dist < 1e-6:
-        return True
-    direction = (direction / dist).astype(np.float32)
-
-    ray = o3d.core.Tensor(
-        np.hstack([eye.astype(np.float32), direction])[None, :],
-        dtype=o3d.core.Dtype.Float32,
-    )
-    hit_dist = float(scene_rc.cast_rays(ray)["t_hit"].numpy()[0])
-    return hit_dist >= dist - tolerance
+    for inst in instances:
+        lo = inst["bbox_min"] - margin
+        hi = inst["bbox_max"] + margin
+        if np.all(pos >= lo) and np.all(pos <= hi):
+            return True
+    return False
 
 
-def find_sphere_position(
+def _arrow_visible_from_viewpoint(
     scene_rc: o3d.t.geometry.RaycastingScene,
-    viewpoints: list[dict],  # each dict has "eye" (np.ndarray) and "w2c" (4×4 np.ndarray)
-    vertices: np.ndarray,
+    vp: dict,
+    arrow_pos: np.ndarray,
+    arrow_target: np.ndarray,
+    K: np.ndarray,
+    width: int,
+    height: int,
+    occlusion_thresh: float,
+    arrow_scale: float = 0.5,
+) -> bool:
+    """Return True if the arrow is visible from the given viewpoint.
+
+    Samples three points along the arrow shaft (base, mid, near-tip) and
+    requires that all are in front of the camera, that the fraction of
+    unoccluded samples meets occlusion_thresh, and that at least one sample
+    projects inside the image frame.
+    """
+    eye     = vp["eye"]
+    w2c     = vp["w2c"]
+    forward = w2c[2, :3]  # camera z-axis in world space
+
+    direction = arrow_target - arrow_pos
+    length = float(np.linalg.norm(direction))
+    if length < 1e-6:
+        return False
+    direction_unit = direction / length
+    scale = min(length, arrow_scale)
+
+    # Three sample points along the arrow
+    samples = np.array([
+        arrow_pos,
+        arrow_pos + direction_unit * scale * 0.5,
+        arrow_pos + direction_unit * scale * 0.85,
+    ])
+
+    # 1. All samples must be in front of the camera
+    for pt in samples:
+        if float(np.dot(pt - eye, forward)) <= 0.0:
+            return False
+
+    # 2. Occlusion check — same logic as for highlighted objects
+    vis = check_occlusion(scene_rc, eye, samples, occlusion_thresh, n_samples=len(samples))
+    if vis < occlusion_thresh:
+        return False
+
+    # 3. At least one sample must project within the image frame
+    pts_2d, depths = project_points(samples, w2c, K)
+    return any(
+        d > 0.1 and 0 <= u < width and 0 <= v < height
+        for (u, v), d in zip(pts_2d, depths)
+    )
+
+
+def find_arrow_position(
+    scene_rc: o3d.t.geometry.RaycastingScene,
+    viewpoints: list[dict],
+    rels: list[dict],
+    ca: np.ndarray,
+    cb: np.ndarray,
+    inst_a: dict,
+    inst_b: dict,
+    instances: list[dict],
     floor_y: float,
     up_idx: int,
-    sphere_radius: float = 0.1,
-    n_candidates: int = 200,
-) -> np.ndarray | None:
-    """Sample a random world position that satisfies all three constraints:
+    vertices: np.ndarray,
+    K: np.ndarray,
+    width: int,
+    height: int,
+    occlusion_thresh: float,
+    arrow_radius: float = 0.08,
+    arrow_height_above_floor: float = 0.7,
+    n_random: int = 300,
+    min_visible: int = 2,
+) -> tuple[np.ndarray | None, list[dict], list[dict]]:
+    """Find a world position for the arrow visible from at least min_visible viewpoints.
 
-    1. In front of every camera  (positive camera-space z, so it renders).
-    2. Unoccluded from every camera eye  (no mesh surface blocks the ray).
-    3. Not clipping into mesh geometry  (nearest surface >= sphere_radius).
+    Two extra placement constraints beyond raycasting occlusion:
 
-    Candidates are drawn uniformly from the 10th–90th-percentile bounding box
-    of the scene in the ground plane at a fixed height above the floor.
+    1. Minimum distance from the centroid midpoint — the arrow must be at least
+       max(longest_bbox_dim_of_A_or_B, centroid_distance) away from the midpoint
+       (measured in the ground plane), so it is never visually embedded in or
+       immediately adjacent to either highlighted object.
 
-    Returns the first valid position, or None if no candidate passes.
+    2. Not inside any instance bounding box — checked via
+       _point_inside_any_instance to prevent the arrow from appearing embedded
+       inside furniture or other scene objects.
+
+    Candidate positions are generated from structured heuristics first (offsets
+    along/perpendicular to the A-B axis and diagonals, including offsets at
+    exactly min_arrow_dist), then random sampling within the scene bounds as a
+    fallback.  Visibility is tested with the same raycasting occlusion logic
+    used for the highlighted objects.
+
+    Returns (arrow_pos, visible_viewpoints, visible_rels) — or (None, [], [])
+    if no suitable position is found.
     """
+    arrow_target = (ca + cb) / 2.0
+    arrow_h = floor_y + arrow_height_above_floor
+
     ground_axes = [a for a in (0, 1, 2) if a != up_idx]
     h0, h1 = ground_axes
 
+    midpoint = (ca + cb) / 2.0
+
+    # Minimum ground-plane distance from midpoint:
+    # max(longest bbox dimension of either object, centroid-to-centroid distance).
+    len_a = float(np.max(inst_a["bbox_max"] - inst_a["bbox_min"]))
+    len_b = float(np.max(inst_b["bbox_max"] - inst_b["bbox_min"]))
+    centroid_dist = float(np.linalg.norm(ca - cb))
+    min_arrow_dist = max(len_a, len_b, centroid_dist)
+
+    d_ab = (cb - ca).copy()
+    d_ab[up_idx] = 0.0
+    d_ab_len = float(np.linalg.norm(d_ab))
+
+    candidates: list[np.ndarray] = []
+
+    if d_ab_len > 1e-6:
+        d_ab_norm = d_ab / d_ab_len
+        d_perp = np.zeros(3)
+        d_perp[h0] = -d_ab_norm[h1]
+        d_perp[h1] =  d_ab_norm[h0]
+
+        # Perpendicular offsets from midpoint — start at min_arrow_dist
+        for dist in (min_arrow_dist, min_arrow_dist * 1.25, min_arrow_dist * 1.5,
+                     min_arrow_dist * 1.75, min_arrow_dist * 2.0):
+            for sign in (1, -1):
+                pt = midpoint.copy()
+                pt[up_idx] = arrow_h
+                pt += sign * dist * d_perp
+                candidates.append(pt.copy())
+
+        # Along-axis offsets beyond midpoint — start at min_arrow_dist
+        for dist in (min_arrow_dist, min_arrow_dist * 1.25, min_arrow_dist * 1.5):
+            for sign in (1, -1):
+                pt = midpoint.copy()
+                pt[up_idx] = arrow_h
+                pt += sign * dist * d_ab_norm
+                candidates.append(pt.copy())
+
+        # Diagonals in all four quadrants at min_arrow_dist and beyond
+        for s1, s2 in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
+            diag = s1 * d_ab_norm + s2 * d_perp
+            diag = diag / np.linalg.norm(diag)
+            for dist in (min_arrow_dist, min_arrow_dist * 1.25, min_arrow_dist * 1.5):
+                pt = midpoint.copy()
+                pt[up_idx] = arrow_h
+                pt += dist * diag
+                candidates.append(pt.copy())
+    else:
+        pt = midpoint.copy()
+        pt[up_idx] = arrow_h
+        candidates.append(pt.copy())
+
+    # Random fallback within the 10th–90th-percentile scene bounding box
     lo0 = float(np.percentile(vertices[:, h0], 10))
     hi0 = float(np.percentile(vertices[:, h0], 90))
     lo1 = float(np.percentile(vertices[:, h1], 10))
     hi1 = float(np.percentile(vertices[:, h1], 90))
+    for _ in range(n_random):
+        pt = np.zeros(3)
+        pt[h0]     = np.random.uniform(lo0, hi0)
+        pt[h1]     = np.random.uniform(lo1, hi1)
+        pt[up_idx] = arrow_h
+        candidates.append(pt)
 
-    sphere_height = floor_y + 0.7  # 0.7 m above floor — clear of floor mesh, below camera
-
-    for _ in range(n_candidates):
-        pos = np.zeros(3)
-        pos[h0]     = np.random.uniform(lo0, hi0)
-        pos[h1]     = np.random.uniform(lo1, hi1)
-        pos[up_idx] = sphere_height
-
-        # 1. Not clipping into mesh geometry
-        if nearest_geometry_distance(scene_rc, pos) < sphere_radius:
+    # Evaluate each candidate
+    for pos in candidates:
+        # Ground-plane distance from midpoint must meet minimum
+        gnd_dist = float(np.linalg.norm((pos - midpoint)[[h0, h1]]))
+        if gnd_dist < min_arrow_dist:
             continue
 
-        # 2. In front of every camera AND unoccluded
-        valid = True
-        for vp in viewpoints:
-            eye     = vp["eye"]
-            forward = vp["w2c"][2, :3]  # camera z-axis in world space (OpenCV: z-forward = row 2 of R)
-            if float(np.dot(pos - eye, forward)) <= 0.0:
-                valid = False
-                break
-            if not _point_visible_from(scene_rc, eye, pos):
-                valid = False
-                break
+        # Must not clip into scene mesh geometry
+        if nearest_geometry_distance(scene_rc, pos) < arrow_radius:
+            continue
 
-        if valid:
-            return pos
+        # Must not be inside any instance's bounding box
+        if _point_inside_any_instance(pos, instances):
+            continue
 
-    return None
+        visible_vps:  list[dict] = []
+        visible_rels: list[dict] = []
+        for vp, rel in zip(viewpoints, rels):
+            if _arrow_visible_from_viewpoint(
+                scene_rc, vp, pos, arrow_target,
+                K, width, height, occlusion_thresh,
+            ):
+                visible_vps.append(vp)
+                visible_rels.append(rel)
+
+        if len(visible_vps) >= min_visible:
+            return pos, visible_vps, visible_rels
+
+    return None, [], []
 
 
 # ---------------------------------------------------------------------------
@@ -1175,41 +1307,28 @@ def process_scene(
         if len(selected_vps) < 2:
             continue
 
-        # Find a single sphere position visible from all viewpoints (once per pair)
+        # Find an arrow position visible from at least 2 of the selected viewpoints.
+        # Viewpoint selection is done first (independent of the arrow); arrow
+        # placement is solved afterwards with structured heuristics + random
+        # sampling, using the same occlusion raycasting as for the objects.
         sphere_pos: np.ndarray | None = None
         if reference_object:
-            sphere_pos = find_sphere_position(
-                scene_rc,
-                selected_vps,
-                vertices,
-                floor_y,
-                up_axis,
+            sphere_pos, arrow_vps, arrow_rels = find_arrow_position(
+                scene_rc, selected_vps, selected_rels, ca, cb,
+                inst_a, inst_b, instances,
+                floor_y, up_axis, vertices, K, width, height, occlusion_thresh,
             )
             if sphere_pos is None:
-                # Fallback: midpoint of the two objects at fixed height.
-                # Every camera looks at this midpoint, so it is always in front.
-                sphere_pos = ((ca + cb) / 2.0).copy()
-                sphere_pos[up_axis] = floor_y + 0.7
-                log.warning(
-                    "  No valid sphere position found for pair %s — falling back to pair midpoint",
+                log.info(
+                    "  Pair %s: no arrow position visible from 2+ viewpoints — skipping pair",
                     pair_id,
                 )
-
-            # Re-filter: only keep viewpoints where the sphere is also visible.
-            # Uses the same criteria as find_sphere_position (in-front + unoccluded).
-            sphere_filtered = [
-                (vp, rel) for vp, rel in zip(selected_vps, selected_rels)
-                if float(np.dot(sphere_pos - vp["eye"], vp["w2c"][2, :3])) > 0
-                and _point_visible_from(scene_rc, vp["eye"], sphere_pos)
-            ]
-            if len(sphere_filtered) < 2:
-                log.info("  Pair %s: fewer than 2 viewpoints can see the sphere — skipping pair", pair_id)
                 continue
-            selected_vps, selected_rels = zip(*sphere_filtered)
-            selected_vps  = list(selected_vps)
-            selected_rels = list(selected_rels)
+            selected_vps  = arrow_vps
+            selected_rels = arrow_rels
 
-            # Re-check that a relation flip still holds among the surviving viewpoints
+            # Re-check that a relation flip still holds among the viewpoints that
+            # can see the arrow (filtering may have dropped one side of the flip).
             flipped = []
             r0 = selected_rels[0]
             for ri in selected_rels[1:]:
@@ -1220,7 +1339,7 @@ def process_scene(
                     if "front_behind" not in flipped:
                         flipped.append("front_behind")
             if not flipped:
-                log.info("  Pair %s: sphere filtering removed the flip — skipping pair", pair_id)
+                log.info("  Pair %s: arrow-visibility filtering removed the flip — skipping pair", pair_id)
                 continue
 
         # Render images and compute 2D bboxes
@@ -1414,7 +1533,7 @@ def parse_args() -> argparse.Namespace:
         "--reference-object",
         action="store_true",
         default=False,
-        help="Add a small coloured sphere at a randomly chosen position visible from all viewpoints.",
+        help="Add a coloured arrow pointing toward the midpoint between the two highlighted objects, placed at a position visible from at least 2 viewpoints.",
     )
     p.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     p.add_argument(
