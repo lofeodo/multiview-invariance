@@ -788,23 +788,63 @@ def _pyvista_render(
             # Rotation matrix mapping canonical axes to world axes
             R = np.column_stack([forward, up_perp, right])  # (3, 3)
 
-            # Create arrow at origin pointing along canonical +X with half the
-            # previous shaft length (scale halved from 0.5 → 0.25)
-            arrow_mesh = pv.Arrow(
-                start=[0.0, 0.0, 0.0],
-                direction=[1.0, 0.0, 0.0],
-                scale=min(length, 0.25),
-                tip_length=0.25,
-                tip_radius=0.1,
-                shaft_radius=0.04,
-            )
+            # Build a flat extruded arrow: rectangular shaft + triangular tip,
+            # extruded along canonical Y (→ world up_perp).
+            #
+            # Size the arrow so it spans a fixed fraction of image height in
+            # screen space, regardless of zoom level.  The perspective formula:
+            #   screen_fraction = world_size / (2 * dist * tan(fov/2))
+            # Solving for world_size gives:
+            #   s = target_fraction * 2 * dist_to_cam * tan(fov/2)
+            dist_to_cam = float(np.linalg.norm(np.array(position) - sphere_center))
+            fov_rad     = np.radians(view_angle)
+            s = 0.2 * dist_to_cam * 2.0 * np.tan(fov_rad / 2.0)
+            s = min(s, length * 0.8)  # don't overshoot the target object
+            tip_x    = s * 0.6      # shaft/tip junction (tip_length=0.4)
+            shaft_hw = s * 0.04     # shaft half-width in right direction
+            tip_hw   = s * 0.10     # tip base half-width in right direction
+            half_t   = s * 0.03     # extrusion half-thickness in up_perp direction
 
-            # Squash in canonical Y (→ world up_perp) to flatten the arrow
-            pts = arrow_mesh.points.copy()
-            pts[:, 1] *= 0.15
+            # 7-vertex arrow outline in canonical XZ plane (forward=+X, right=+Z).
+            # Listed CCW when viewed from +Y so front-face normal points +Y.
+            profile = np.array([
+                [0,      -shaft_hw],
+                [tip_x,  -shaft_hw],
+                [tip_x,  -tip_hw],
+                [s,       0.0],
+                [tip_x,   tip_hw],
+                [tip_x,   shaft_hw],
+                [0,       shaft_hw],
+            ])
+            nv = len(profile)  # 7
+
+            # Front vertices at y=+half_t, back vertices at y=-half_t
+            front = np.column_stack([profile[:, 0], np.full(nv,  half_t), profile[:, 1]])
+            back  = np.column_stack([profile[:, 0], np.full(nv, -half_t), profile[:, 1]])
+            verts = np.vstack([front, back]).astype(np.float64)
+
+            # Manually triangulate to avoid VTK mishandling the concave arrow polygon.
+            # The profile is split at the shaft/tip junction (vertices 1 and 5):
+            #   shaft rectangle: verts 0,1,5,6  →  2 triangles
+            #   tip pentagon:    verts 1,2,3,4,5 → 3 triangles
+            # Back face uses same decomposition with reversed winding (+nv offset).
+            # Side faces: each edge becomes 2 triangles.
+            faces = []
+            # Front face (CCW from +Y)
+            faces += [[3,0,1,5], [3,0,5,6]]            # shaft
+            faces += [[3,1,2,3], [3,1,3,4], [3,1,4,5]] # tip
+            # Back face (reversed winding → normal points -Y)
+            faces += [[3,0+nv,5+nv,1+nv], [3,0+nv,6+nv,5+nv]]
+            faces += [[3,1+nv,3+nv,2+nv], [3,1+nv,4+nv,3+nv], [3,1+nv,5+nv,4+nv]]
+            # Side faces (2 triangles per edge)
+            for i in range(nv):
+                j = (i + 1) % nv
+                faces += [[3, i, j, j + nv], [3, i, j + nv, i + nv]]
+
+            arrow_mesh = pv.PolyData(verts, np.hstack(faces))
 
             # Rotate into world space and translate to the arrow's position
-            arrow_mesh.points = (R @ pts.T).T + sphere_center
+            arrow_mesh.points = (R @ arrow_mesh.points.T).T + sphere_center
 
             plotter.add_mesh(arrow_mesh, color=np.clip(sphere_color, 0.0, 1.0).tolist())
 

@@ -12,11 +12,7 @@ An optional **reference arrow** can be placed in the scene pointing toward the m
 
 ```bash
 python download_scenes.py --scenes 0
-python generate_viewpoint_pairs.py \
-    --scene_dir scannet_data/scene0000_00 \
-    --fov 60 --resolution_w 1024 --resolution_h 768 \
-    --max_pairs_per_scene 6 --min_object_volume 0.2 \
-    --reference-object --print-reference-image
+python generate_viewpoint_pairs.py --fov 60 --resolution_w 1024 --resolution_h 768 --max_pairs_per_scene 6 --min_object_volume 0.2 --reference-object --print-reference-image --scene_dir scannet_data/scene0000_00 --occlusion_ray_threshold 0.5
 ```
 
 ---
