@@ -1804,26 +1804,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--reference-object",
         action="store_true",
-        default=True,
-        help="Add a coloured arrow pointing toward the midpoint between the two highlighted objects, placed at a position visible from at least 2 viewpoints. On by default.",
-    )
-    p.add_argument(
-        "--no-reference-object",
-        dest="reference_object",
-        action="store_false",
-        help="Disable the reference arrow.",
+        default=False,
+        help="Add a coloured arrow pointing toward the midpoint between the two highlighted objects, placed at a position visible from at least 2 viewpoints.",
     )
     p.add_argument(
         "--print-reference-image",
         action="store_true",
-        default=True,
-        help="Render an additional image from the arrow's viewpoint and save it as objA_x_objB_y_view_arrow.png. Requires --reference-object. On by default.",
-    )
-    p.add_argument(
-        "--no-print-reference-image",
-        dest="print_reference_image",
-        action="store_false",
-        help="Disable rendering of the arrow-viewpoint image.",
+        default=False,
+        help="Render an additional image from the arrow's viewpoint and save it as objA_x_objB_y_view_arrow.png. Requires --reference-object.",
     )
     p.add_argument(
         "--max-arrow-occlusion",
