@@ -279,20 +279,18 @@ The `reference_object_arrow` block is only present when `--reference-object` is 
 
 ### Spatial relation conventions
 
-Spatial relations reflect what is visible in the rendered image.
-
 Each axis is represented by a complementary pair. Both members of a pair cannot be true simultaneously, but both can be false when the objects are too close together along that axis (within the dead zone).
 
 | Field | Meaning when `true` |
 |---|---|
-| `A_left_of_B` | A appears more than 20 px to the left of B in the image |
-| `A_right_of_B` | A appears more than 20 px to the right of B in the image |
-| `A_in_front_of_B` | A is more than 0.1 m closer to the camera than B |
-| `A_behind_B` | A is more than 0.1 m further from the camera than B |
-| `A_above_B` | A appears more than 20 px above B in the image |
-| `A_below_B` | A appears more than 20 px below B in the image |
+| `A_left_of_B` | A appears more than 20 px to the left of B in the image (projected pixel x) |
+| `A_right_of_B` | A appears more than 20 px to the right of B in the image (projected pixel x) |
+| `A_in_front_of_B` | A is more than 0.1 m closer to the camera than B (camera-space depth) |
+| `A_behind_B` | A is more than 0.1 m further from the camera than B (camera-space depth) |
+| `A_above_B` | A's centroid is more than 0.1 m higher than B's **and** A's bounding-box bottom is more than 0.1 m higher than B's (world-space up axis) |
+| `A_below_B` | A's centroid is more than 0.1 m lower than B's **and** A's bounding-box bottom is more than 0.1 m lower than B's (world-space up axis) |
 
-Left/right and above/below use projected pixel coordinates (including perspective division), so they match what is visible in the rendered image even when objects are at different depths.
+Left/right uses projected pixel coordinates (image-plane x, including perspective division), matching what appears visually left/right in the rendered image. Above/below requires both the centroid and the bounding-box bottom of A to be strictly higher (or lower) than B's by at least 0.1 m, using world-space up-axis coordinates; this is independent of camera perspective. Front/behind uses camera-space depth.
 
 The `flipped_relations` list tells you which of these flipped across the viewpoint pair, e.g. `["left_right"]` means view 0 has A-left-of-B and view 1 has A-right-of-B.
 

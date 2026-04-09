@@ -312,37 +312,49 @@ def compute_spatial_relations(
     centroid_b_world: np.ndarray,
     w2c: np.ndarray,
     K: np.ndarray,
+    bbox_min_a: np.ndarray,
+    bbox_min_b: np.ndarray,
+    up_idx: int = 1,
     px_threshold: float = 20.0,
     depth_threshold: float = 0.1,
+    height_threshold: float = 0.1,
 ) -> dict:
     """Compute spatial relations between A and B as seen from the camera.
 
-    Left/right and above/below use projected pixel coordinates so they match
-    what is visually left/above in the rendered image (includes perspective
-    division). Front/behind uses camera-space z (depth).
+    Left/right uses projected pixel coordinates (image-plane x) so it matches
+    what is visually left in the rendered image (includes perspective division).
+    Front/behind uses camera-space z (depth).
+    Above/below requires BOTH: (1) A's centroid is higher than B's centroid by
+    at least height_threshold, AND (2) the bottom of A's bounding box is higher
+    than the bottom of B's bounding box by at least height_threshold.  Both
+    conditions use world-space up-axis coordinates so the result is independent
+    of camera perspective.
 
     Each axis has a dead zone: if the difference is smaller than the threshold,
     neither direction is true (both can be false, but both cannot be true).
 
-    px_threshold    : pixel dead zone for left/right and above/below (default 20 px)
+    up_idx          : world axis index for up (0=X, 1=Y, 2=Z)
+    px_threshold    : pixel dead zone for left/right (default 20 px)
     depth_threshold : metre dead zone for front/behind (default 0.1 m)
+    height_threshold: metre threshold for above/below centroid and bbox-bottom (default 0.1 m)
     """
     pts = world_to_cam(np.stack([centroid_a_world, centroid_b_world]), w2c)
     a_cam, b_cam = pts[0], pts[1]
     uv, _ = project_points(np.stack([centroid_a_world, centroid_b_world]), w2c, K)
     a_px, b_px = uv[0], uv[1]
 
-    dx = float(a_px[0] - b_px[0])
-    dy = float(a_px[1] - b_px[1])
-    dz = float(a_cam[2] - b_cam[2])
+    dx        = float(a_px[0] - b_px[0])
+    dz        = float(a_cam[2] - b_cam[2])
+    dh_cen    = float(centroid_a_world[up_idx] - centroid_b_world[up_idx])   # positive = A centroid higher
+    dh_bottom = float(bbox_min_a[up_idx]       - bbox_min_b[up_idx])         # positive = A bottom higher
 
     return {
         "A_left_of_B":     dx < -px_threshold,
         "A_right_of_B":    dx >  px_threshold,
         "A_in_front_of_B": dz < -depth_threshold,
         "A_behind_B":      dz >  depth_threshold,
-        "A_above_B":       dy < -px_threshold,   # y-down: smaller pixel-y is higher
-        "A_below_B":       dy >  px_threshold,
+        "A_above_B":       dh_cen >  height_threshold and dh_bottom >  height_threshold,
+        "A_below_B":       dh_cen < -height_threshold and dh_bottom < -height_threshold,
     }
 
 
@@ -487,6 +499,66 @@ def check_occlusion(
     hit_dist = hits["t_hit"].numpy()  # (N,)
 
     # A ray reaches the object if it hits at roughly the expected distance (±0.1m)
+    reached = np.sum(
+        (hit_dist >= expected_dist - 0.15) & (hit_dist < expected_dist + 0.15)
+    )
+    return float(reached) / len(targets)
+
+
+def check_occlusion_from_view(
+    scene: o3d.t.geometry.RaycastingScene,
+    camera_pos: np.ndarray,
+    object_vertices: np.ndarray,  # (k, 3) world coords
+    w2c: np.ndarray,
+    K: np.ndarray,
+    width: int,
+    height: int,
+    n_samples: int = 32,
+) -> float:
+    """Like check_occlusion, but restricts sampled vertices to those that
+    project within the camera's field of view.
+
+    This ensures the occlusion check only tests vertices that would actually
+    appear in the rendered image (in front of the camera and within the image
+    frame), rather than all vertices regardless of direction.  This is critical
+    for low camera positions (e.g. the arrow's viewpoint) where top/side
+    vertices can be unobstructed while the front-facing vertices visible in
+    the image are blocked by intermediate furniture.
+
+    Returns the fraction of in-frustum sampled vertices that are unobstructed,
+    or 0.0 if no object vertices project into the image frame.
+    """
+    if len(object_vertices) == 0:
+        return 0.0
+
+    # Keep only vertices in front of the camera and within the image bounds
+    pts_2d, depths = project_points(object_vertices, w2c, K)
+    in_frustum = (
+        (depths > 0.1)
+        & (pts_2d[:, 0] >= 0) & (pts_2d[:, 0] < width)
+        & (pts_2d[:, 1] >= 0) & (pts_2d[:, 1] < height)
+    )
+    frustum_verts = object_vertices[in_frustum]
+    if len(frustum_verts) == 0:
+        return 0.0
+
+    idx = np.random.choice(len(frustum_verts), size=min(n_samples, len(frustum_verts)), replace=False)
+    targets = frustum_verts[idx]
+
+    origins = np.tile(camera_pos.astype(np.float32), (len(targets), 1))
+    directions = targets.astype(np.float32) - origins
+    norms = np.linalg.norm(directions, axis=1, keepdims=True)
+    valid = (norms[:, 0] > 1e-4)
+    directions[valid] = directions[valid] / norms[valid]
+    expected_dist = norms[:, 0]
+
+    rays = o3d.core.Tensor(
+        np.hstack([origins, directions]).astype(np.float32),
+        dtype=o3d.core.Dtype.Float32,
+    )
+    hits = scene.cast_rays(rays)
+    hit_dist = hits["t_hit"].numpy()
+
     reached = np.sum(
         (hit_dist >= expected_dist - 0.15) & (hit_dist < expected_dist + 0.15)
     )
@@ -1206,12 +1278,14 @@ def find_arrow_position(
             continue
 
         # Both highlighted objects must be sufficiently visible from the arrow's
-        # own pose (same occlusion + frustum checks as validate_camera).
+        # own pose. Use frustum-filtered occlusion: only test vertices that
+        # project within the camera frame, matching what the rendered image
+        # will actually show.
         world_up_vec = np.zeros(3); world_up_vec[up_idx] = 1.0
         w2c_cand = look_at_matrix(pos, arrow_target, world_up_vec)
-        if check_occlusion(scene_rc, pos, vertices[inst_a["vertex_indices"]], occlusion_thresh) < occlusion_thresh:
+        if check_occlusion_from_view(scene_rc, pos, vertices[inst_a["vertex_indices"]], w2c_cand, K, width, height) < occlusion_thresh:
             continue
-        if check_occlusion(scene_rc, pos, vertices[inst_b["vertex_indices"]], occlusion_thresh) < occlusion_thresh:
+        if check_occlusion_from_view(scene_rc, pos, vertices[inst_b["vertex_indices"]], w2c_cand, K, width, height) < occlusion_thresh:
             continue
         if not objects_in_frustum(inst_a["centroid"], inst_a["bbox_min"], inst_a["bbox_max"], w2c_cand, K, width, height, min_proj_size):
             continue
@@ -1397,7 +1471,9 @@ def process_scene(
 
         # Compute spatial relations for all valid viewpoints
         rels = [
-            compute_spatial_relations(ca, cb, vp["w2c"], K)
+            compute_spatial_relations(ca, cb, vp["w2c"], K,
+                                      inst_a["bbox_min"], inst_b["bbox_min"],
+                                      up_idx=up_axis)
             for vp in valid_viewpoints
         ]
 
@@ -1481,7 +1557,9 @@ def process_scene(
         if sphere_pos is not None:
             arrow_target_pos = (ca + cb) / 2.0
             w2c_arrow = look_at_matrix(sphere_pos, arrow_target_pos, world_up_vec)
-            arrow_spatial_rels = compute_spatial_relations(ca, cb, w2c_arrow, K)
+            arrow_spatial_rels = compute_spatial_relations(ca, cb, w2c_arrow, K,
+                                                           inst_a["bbox_min"], inst_b["bbox_min"],
+                                                           up_idx=up_axis)
 
             # Pose description: position, forward/right/up axes, and the world-up
             # convention used (camera up = world up = floor normal).
