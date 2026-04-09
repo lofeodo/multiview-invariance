@@ -140,6 +140,7 @@ python generate_viewpoint_pairs.py --scene_dir scannet_data --batch
 | `--reference-object` | off | Place a coloured arrow in each scene pointing toward the midpoint between the two highlighted objects |
 | `--print-reference-image` | off | Render an extra image from the arrow's own viewpoint and save it as `objA_x_objB_y_view_arrow.png`. Requires `--reference-object` |
 | `--max-arrow-occlusion` | `0.8` | Minimum fraction of arrow sample rays that must reach the arrow unblocked from a viewpoint (0–1). Used to determine whether the arrow is visible from each camera |
+| `--verbose_output` | off | Include all technical fields in the metadata JSON (`axis_alignment_applied`, `camera_conventions`, `color_rgb`, `pose`, `flipped_relations`). Off by default for a cleaner output |
 | `--seed` | `42` | Random seed (controls pair enumeration order) |
 | `--log_level` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 

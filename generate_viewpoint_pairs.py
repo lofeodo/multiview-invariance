@@ -1335,6 +1335,7 @@ def process_scene(
     reference_object: bool = False,
     print_reference_image: bool = False,
     arrow_occlusion_thresh: float = 0.8,
+    verbose_output: bool = False,
 ) -> None:
     """Process a single ScanNet scene directory."""
     scene_id = scene_dir.name
@@ -1704,29 +1705,30 @@ def process_scene(
             (ca + cb) / 2.0,
         )
 
-        group = {
-            "pair_id": pair_id,
-            "object_A": {
-                "instance_id": inst_a["instance_id"],
-                "label": inst_a["label"],
-                "color": color_name_a,
-                "color_rgb": [round(float(v), 3) for v in color_rgb_a],
-            },
-            "object_B": {
-                "instance_id": inst_b["instance_id"],
-                "label": inst_b["label"],
-                "color": color_name_b,
-                "color_rgb": [round(float(v), 3) for v in color_rgb_b],
-            },
-            **({"reference_object_arrow": {
+        def _obj_entry(label, color_name, color_rgb):
+            d = {"instance_id": label["instance_id"], "label": label["label"], "color": color_name}
+            if verbose_output:
+                d["color_rgb"] = [round(float(v), 3) for v in color_rgb]
+            return d
+
+        arrow_entry = {}
+        if reference_object:
+            arrow_entry = {
                 "color": color_name_sp,
-                "color_rgb": [round(float(v), 3) for v in color_rgb_sp],
-                "pose": arrow_pose,
                 "spatial_relations_from_arrow": arrow_spatial_rels,
                 **({"image_path": arrow_image_path} if arrow_image_path is not None else {}),
-            }} if reference_object else {}),
+            }
+            if verbose_output:
+                arrow_entry["color_rgb"] = [round(float(v), 3) for v in color_rgb_sp]
+                arrow_entry["pose"] = arrow_pose
+
+        group = {
+            "pair_id": pair_id,
+            "object_A": _obj_entry(inst_a, color_name_a, color_rgb_a),
+            "object_B": _obj_entry(inst_b, color_name_b, color_rgb_b),
+            **({"reference_object_arrow": arrow_entry} if reference_object else {}),
             "viewpoints": viewpoint_records,
-            "flipped_relations": flipped,
+            **({"flipped_relations": flipped} if verbose_output else {}),
             "viewpoint_angular_separation_degrees": round(overall_ang, 2),
         }
         viewpoint_groups.append(group)
@@ -1739,9 +1741,9 @@ def process_scene(
     # Save metadata JSON
     metadata = {
         "scene_id": scene_id,
-        "axis_alignment_applied": True,
+        **({"axis_alignment_applied": True} if verbose_output else {}),
         "up_axis": ["X", "Y", "Z"][up_axis],
-        "camera_conventions": "OpenCV (x-right, y-down, z-forward)",
+        **({"camera_conventions": "OpenCV (x-right, y-down, z-forward)"} if verbose_output else {}),
         "viewpoint_groups": viewpoint_groups,
     }
     meta_path = scene_out / "metadata.json"
@@ -1821,6 +1823,12 @@ def parse_args() -> argparse.Namespace:
         default=0.8,
         help="Minimum fraction of arrow sample rays that must reach the arrow unblocked (0–1). Default 0.8 = 80%% visible.",
     )
+    p.add_argument(
+        "--verbose_output",
+        action="store_true",
+        default=False,
+        help="Include all technical fields in the metadata JSON (axis_alignment_applied, camera_conventions, color_rgb, pose, flipped_relations). Off by default.",
+    )
     p.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     p.add_argument(
         "--log_level",
@@ -1857,6 +1865,7 @@ def main() -> None:
         reference_object=args.reference_object,
         print_reference_image=args.print_reference_image,
         arrow_occlusion_thresh=args.max_arrow_occlusion,
+        verbose_output=args.verbose_output,
     )
 
     scene_dir = Path(args.scene_dir)
