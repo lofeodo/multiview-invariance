@@ -56,7 +56,7 @@ DEFAULT_SKIP_LABELS = {
     "windowsill", "beam", "column", "pipe", "stair",
     "railing", "floor mat",
 }
-DEFAULT_MIN_OBJECT_VOLUME = 0.005   # m³
+DEFAULT_MIN_OBJECT_VOLUME = 0.2     # m³
 DEFAULT_MIN_CENTROID_DIST = 0.5     # m
 DEFAULT_MAX_CENTROID_DIST = 5.0     # m
 DEFAULT_STANDOFF_FACTOR = 1.5       # ×(centroid distance)
@@ -67,8 +67,8 @@ DEFAULT_FOV = 60.0                  # degrees
 DEFAULT_RES_W = 1024
 DEFAULT_RES_H = 768
 DEFAULT_MIN_PROJ_SIZE = 50          # pixels
-DEFAULT_OCCLUSION_THRESH = 0.20     # fraction of rays that must reach object
-DEFAULT_MAX_PAIRS = 20              # per scene
+DEFAULT_OCCLUSION_THRESH = 0.50     # fraction of rays that must reach object
+DEFAULT_MAX_PAIRS = 6               # per scene
 DEFAULT_NEAR_GEOM_DIST = 0.3        # m — camera collision threshold
 
 # ---------------------------------------------------------------------------
@@ -1687,10 +1687,8 @@ def process_scene(
                 {
                     "viewpoint_index": vi,
                     "image_path": f"images/{img_name}",
-                    "fov_degrees": fov,
-                    "image_resolution": [width, height],
+                    **({"fov_degrees": fov, "image_resolution": [width, height], "viewpoint_label": vp["label"]} if verbose_output else {}),
                     "spatial_relations": rel,
-                    "viewpoint_label": vp["label"],
                     "angular_sep_from_view0_deg": round(ang_sep, 2),
                     "yaw_to_arrow": yaw_to_arrow,
                 }
@@ -1808,14 +1806,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--reference-object",
         action="store_true",
-        default=False,
-        help="Add a coloured arrow pointing toward the midpoint between the two highlighted objects, placed at a position visible from at least 2 viewpoints.",
+        default=True,
+        help="Add a coloured arrow pointing toward the midpoint between the two highlighted objects, placed at a position visible from at least 2 viewpoints. On by default.",
+    )
+    p.add_argument(
+        "--no-reference-object",
+        dest="reference_object",
+        action="store_false",
+        help="Disable the reference arrow.",
     )
     p.add_argument(
         "--print-reference-image",
         action="store_true",
-        default=False,
-        help="Render an additional image from the arrow's viewpoint and save it as objA_x_objB_y_view_arrow.png. Requires --reference-object.",
+        default=True,
+        help="Render an additional image from the arrow's viewpoint and save it as objA_x_objB_y_view_arrow.png. Requires --reference-object. On by default.",
+    )
+    p.add_argument(
+        "--no-print-reference-image",
+        dest="print_reference_image",
+        action="store_false",
+        help="Disable rendering of the arrow-viewpoint image.",
     )
     p.add_argument(
         "--max-arrow-occlusion",

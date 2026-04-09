@@ -12,7 +12,7 @@ An optional **reference arrow** can be placed in the scene pointing toward the m
 
 ```bash
 python download_scenes.py --scenes 0
-python generate_viewpoint_pairs.py --fov 60 --resolution_w 1024 --resolution_h 768 --max_pairs_per_scene 6 --min_object_volume 0.2 --reference-object --print-reference-image --scene_dir scannet_data/scene0000_00 --occlusion_ray_threshold 0.5
+python generate_viewpoint_pairs.py --scene_dir scannet_data/scene0000_00
 ```
 
 ---
@@ -121,7 +121,7 @@ python generate_viewpoint_pairs.py --scene_dir scannet_data --batch
 | `--scene_dir` | *(required)* | Path to a scene dir, or root dir when using `--batch` |
 | `--output_dir` | `outputs` | Root directory for all outputs |
 | `--batch` | off | Process all `scene*` subdirs under `--scene_dir` |
-| `--min_object_volume` | `0.005` m³ | Skip objects smaller than this (removes clutter) |
+| `--min_object_volume` | `0.2` m³ | Skip objects smaller than this (removes clutter) |
 | `--min_centroid_distance` | `0.5` m | Minimum distance between object pair centroids |
 | `--max_centroid_distance` | `5.0` m | Maximum distance between object pair centroids |
 | `--standoff_distance_factor` | `1.5` | Camera standoff = this × centroid distance |
@@ -132,15 +132,15 @@ python generate_viewpoint_pairs.py --scene_dir scannet_data --batch
 | `--resolution_w` | `1024` px | Render width |
 | `--resolution_h` | `768` px | Render height |
 | `--min_projected_size` | `50` px | Reject viewpoints where an object's 2D bbox is smaller than this |
-| `--occlusion_ray_threshold` | `0.20` | Fraction of sample rays that must reach an object (else it's occluded) |
-| `--max_pairs_per_scene` | `20` | Cap on how many pairs to save per scene |
+| `--occlusion_ray_threshold` | `0.50` | Fraction of sample rays that must reach an object (else it's occluded) |
+| `--max_pairs_per_scene` | `6` | Cap on how many pairs to save per scene |
 | `--skip_labels` | *(see below)* | Space-separated object labels to ignore |
 | `--near_geom_dist` | `0.3` m | Camera is invalid if closer than this to any geometry |
 | `--full-colour` | off | Render in original scene colours; disables grayscale conversion and object highlighting |
-| `--reference-object` | off | Place a coloured arrow in each scene pointing toward the midpoint between the two highlighted objects |
-| `--print-reference-image` | off | Render an extra image from the arrow's own viewpoint and save it as `objA_x_objB_y_view_arrow.png`. Requires `--reference-object` |
+| `--reference-object` | on | Place a coloured arrow in each scene pointing toward the midpoint between the two highlighted objects. Use `--no-reference-object` to disable |
+| `--print-reference-image` | on | Render an extra image from the arrow's own viewpoint and save it as `objA_x_objB_y_view_arrow.png`. Use `--no-print-reference-image` to disable |
 | `--max-arrow-occlusion` | `0.8` | Minimum fraction of arrow sample rays that must reach the arrow unblocked from a viewpoint (0–1). Used to determine whether the arrow is visible from each camera |
-| `--verbose_output` | off | Include all technical fields in the metadata JSON (`axis_alignment_applied`, `camera_conventions`, `color_rgb`, `pose`, `flipped_relations`). Off by default for a cleaner output |
+| `--verbose_output` | off | Include all technical fields in the metadata JSON (`axis_alignment_applied`, `camera_conventions`, `color_rgb`, `pose`, `flipped_relations`, `fov_degrees`, `image_resolution`, `viewpoint_label`). Off by default for a cleaner output |
 | `--seed` | `42` | Random seed (controls pair enumeration order) |
 | `--log_level` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 
