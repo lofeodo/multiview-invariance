@@ -1393,9 +1393,7 @@ def process_scene(
     # Output dirs
     scene_out = output_dir / scene_id
     img_dir = scene_out / "images"
-    vp_dir = output_dir / "viewpoints" / f"scene{scene_id.replace('scene', '')}"
     img_dir.mkdir(parents=True, exist_ok=True)
-    vp_dir.mkdir(parents=True, exist_ok=True)
 
     # Enumerate pairs
     all_pairs = list(combinations(range(len(instances)), 2))
@@ -1590,7 +1588,6 @@ def process_scene(
             if print_reference_image:
                 arrow_img_name = f"objA_{inst_a['instance_id']}_objB_{inst_b['instance_id']}_view_arrow.png"
                 arrow_img_path = img_dir / arrow_img_name
-                arrow_vp_path  = vp_dir  / arrow_img_name
                 try:
                     rgb_arrow = render_scene(
                         mesh, w2c_arrow, K, width, height,
@@ -1600,7 +1597,6 @@ def process_scene(
                         color_b_rgb=None if full_colour else color_rgb_b,
                     )
                     Image.fromarray(rgb_arrow).save(str(arrow_img_path))
-                    Image.fromarray(rgb_arrow).save(str(arrow_vp_path))
                     arrow_image_path = f"images/{arrow_img_name}"
                 except Exception as exc:
                     log.warning("  Arrow-view render failed: %s", exc)
@@ -1612,7 +1608,6 @@ def process_scene(
         for vi, (vp, rel) in enumerate(zip(selected_vps, selected_rels)):
             img_name = f"objA_{inst_a['instance_id']}_objB_{inst_b['instance_id']}_view_{vi}.png"
             img_path = img_dir / img_name
-            vp_img_path = vp_dir / img_name
 
             try:
                 rgb = render_scene(
@@ -1627,7 +1622,6 @@ def process_scene(
                     arrow_up=world_up_vec if sphere_pos is not None else None,
                 )
                 Image.fromarray(rgb).save(str(img_path))
-                Image.fromarray(rgb).save(str(vp_img_path))
             except Exception as exc:
                 log.warning("  Render failed for viewpoint %d: %s", vi, exc)
                 any_render_failed = True
@@ -1674,6 +1668,20 @@ def process_scene(
                     (ca + cb) / 2.0,
                 )
 
+            # Yaw misalignment between the camera's facing direction and the
+            # arrow's facing direction, both projected onto the horizontal plane.
+            # 0° = camera and arrow face the same way; 180° = they face opposite ways.
+            yaw_to_arrow: float | None = None
+            if sphere_pos is not None:
+                h0, h1 = [a for a in (0, 1, 2) if a != up_axis]
+                midpoint = (ca + cb) / 2.0
+                cam_fwd   = (vp["target"] - vp["eye"]).copy();   cam_fwd[up_axis]   = 0.0
+                arrow_fwd = (midpoint     - sphere_pos).copy();  arrow_fwd[up_axis] = 0.0
+                angle_cam   = math.atan2(float(cam_fwd[h1]),   float(cam_fwd[h0]))
+                angle_arrow = math.atan2(float(arrow_fwd[h1]), float(arrow_fwd[h0]))
+                yaw = math.degrees(angle_arrow - angle_cam)
+                yaw_to_arrow = round((yaw + 180.0) % 360.0 - 180.0, 2)
+
             viewpoint_records.append(
                 {
                     "viewpoint_index": vi,
@@ -1683,6 +1691,7 @@ def process_scene(
                     "spatial_relations": rel,
                     "viewpoint_label": vp["label"],
                     "angular_sep_from_view0_deg": round(ang_sep, 2),
+                    "yaw_to_arrow": yaw_to_arrow,
                 }
             )
 
