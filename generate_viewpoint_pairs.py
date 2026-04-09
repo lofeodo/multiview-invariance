@@ -1491,14 +1491,12 @@ def process_scene(
             log.info("  No relation flip detected — skipping pair")
             continue
 
-        # Cap at 3 viewpoints (prefer the flip pair + one diagonal)
-        # Ensure we keep viewpoints from both sides of the flip
+        # Keep exactly 2 viewpoints (one from each side of the flip)
         selected_vps: list[dict] = []
         selected_rels: list[dict] = []
-        # Keep at most one from each "side" (perp_pos/perp_neg, along_pos/along_neg)
         seen_sides = set()
         for vp, rel in zip(valid_viewpoints, rels):
-            if len(selected_vps) >= 3:
+            if len(selected_vps) >= 2:
                 break
             side_key = vp["label"]
             if side_key not in seen_sides:
