@@ -306,6 +306,8 @@ Spatial relations in `spatial_relations_from_arrow` follow the same conventions 
 
 ## Typical workflow
 
+### Part 1 — Data generation
+
 ```bash
 # 1. Download scenes (specific, range, or all)
 python download_scenes.py --scenes 0 1 2  # specific
@@ -328,3 +330,117 @@ python generate_viewpoint_pairs.py \
     --reference-object --print-reference-image \
     --skip_existing
 ```
+
+### Part 2 — Dataset consolidation and benchmarking
+
+After generating outputs for one or more scenes, build a single global index and load it for benchmarking.
+
+```bash
+# 5. Build the consolidated dataset index (reads all outputs/*/metadata.json)
+python build_dataset_index.py
+
+# Re-run any time you add new scene outputs to keep the index up to date.
+# Previously written index files are overwritten.
+```
+
+This creates:
+
+```
+dataset/
+    scenes.jsonl    — one record per scene
+    groups.jsonl    — one record per object pair (group)
+    examples.jsonl  — one record per viewpoint image (example)
+```
+
+```python
+# 6. Load the dataset in your benchmark script
+from dataset import MultiviewDataset
+
+ds = MultiviewDataset("dataset")
+print(ds)
+# MultiviewDataset(700 scenes, 2100 groups, 4200 examples)
+
+# Iterate examples — all viewpoints for the same pair are always adjacent
+for example in ds.iter_examples():
+    image = example["image_path"]         # e.g. "outputs/scene0700_00/images/..."
+    labels = example["spatial_relations"] # dict of bool flags
+    group = example["group_id"]           # e.g. "scene0700_00__10_11"
+
+# Iterate by group (one group = one object pair across all its viewpoints)
+for group, examples in ds.iter_groups():
+    print(group["group_id"], "→", len(examples), "viewpoints")
+
+# Get all viewpoints for a specific pair
+examples = ds.get_group_examples("scene0700_00__10_11")
+
+# Shuffle groups globally before benchmarking
+# Viewpoints within each group always stay together — the group is atomic
+ds.shuffle_groups(seed=42)
+
+# Train / test split — split unit is the scene, so no scene leaks across splits
+train_ds, test_ds = ds.split_by_scene(train_frac=0.8, seed=42)
+print(len(train_ds.scenes), "train /", len(test_ds.scenes), "test scenes")
+```
+
+---
+
+## Consolidated dataset schema
+
+### scenes.jsonl
+
+| Field | Type | Description |
+|---|---|---|
+| `scene_id` | str | e.g. `"scene0700_00"` |
+| `n_groups` | int | Number of object pairs in this scene |
+
+### groups.jsonl
+
+| Field | Type | Description |
+|---|---|---|
+| `group_id` | str | `{scene_id}__{pair_id}`, e.g. `"scene0700_00__10_11"` |
+| `scene_id` | str | Parent scene |
+| `pair_id` | str | `{instance_id_A}_{instance_id_B}` |
+| `object_A` | dict | `instance_id`, `label`, `color` |
+| `object_B` | dict | `instance_id`, `label`, `color` |
+| `reference_object_arrow` | dict? | Arrow metadata (present when `--reference-object` was used) |
+| `n_viewpoints` | int | Number of rendered viewpoints for this pair |
+| `viewpoint_angular_separation_degrees` | float | Angular separation between view 0 and view 1 |
+
+### examples.jsonl
+
+| Field | Type | Description |
+|---|---|---|
+| `example_id` | str | `{scene_id}__{pair_id}__view_{i}`, e.g. `"scene0700_00__10_11__view_0"` |
+| `group_id` | str | Parent group |
+| `scene_id` | str | Parent scene |
+| `pair_id` | str | `{instance_id_A}_{instance_id_B}` |
+| `viewpoint_index` | int | Index within the group (0, 1, …) |
+| `image_path` | str | Project-root-relative path to the PNG, e.g. `"outputs/scene0700_00/images/..."` |
+| `spatial_relations` | dict | Six bool flags (see *Spatial relation conventions* above) |
+| `angular_sep_from_view0_deg` | float | Degrees from view 0 to this view |
+| `yaw_to_arrow` | float? | Yaw misalignment between camera and arrow (when `--reference-object` was used) |
+
+---
+
+## How to do a correct train / test split
+
+The correct split unit is the **scene** (not the example or group).  Using any smaller unit risks leaking related views of the same object pair into both splits, which inflates test accuracy.
+
+```python
+from dataset import MultiviewDataset
+
+ds = MultiviewDataset("dataset")
+train_ds, test_ds = ds.split_by_scene(train_frac=0.8, seed=42)
+
+# Every scene appears in exactly one split.
+train_scene_ids = {s["scene_id"] for s in train_ds.scenes}
+test_scene_ids  = {s["scene_id"] for s in test_ds.scenes}
+assert train_scene_ids.isdisjoint(test_scene_ids)  # guaranteed
+
+# Benchmark on the test set with shuffled group order
+test_ds.shuffle_groups(seed=0)
+for example in test_ds.iter_examples():
+    ...
+```
+
+`split_by_scene` shuffles scene IDs with `seed`, then takes the first `train_frac` fraction as train and the rest as test.  Re-running with the same seed always produces the same split.
