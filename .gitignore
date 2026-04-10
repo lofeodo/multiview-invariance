@@ -1,2 +1,4 @@
 scannet_data/*
 outputs/*
+dataset/*
+*.pyc
