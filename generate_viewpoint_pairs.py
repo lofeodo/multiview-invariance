@@ -1336,10 +1336,15 @@ def process_scene(
     print_reference_image: bool = False,
     arrow_occlusion_thresh: float = 0.8,
     verbose_output: bool = False,
+    skip_existing: bool = False,
 ) -> None:
     """Process a single ScanNet scene directory."""
     scene_id = scene_dir.name
     log.info("=== Processing scene: %s ===", scene_id)
+
+    if skip_existing and (output_dir / scene_id).exists():
+        log.info("Scene %s already in output — skipping", scene_id)
+        return
 
     # Locate files
     ply_path = scene_dir / f"{scene_id}_vh_clean_2.ply"
@@ -1827,6 +1832,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     p.add_argument(
+        "--skip_existing",
+        action="store_true",
+        default=False,
+        help="Skip scenes that already have an output directory in --output_dir.",
+    )
+    p.add_argument(
         "--log_level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -1862,6 +1873,7 @@ def main() -> None:
         print_reference_image=args.print_reference_image,
         arrow_occlusion_thresh=args.max_arrow_occlusion,
         verbose_output=args.verbose_output,
+        skip_existing=args.skip_existing,
     )
 
     scene_dir = Path(args.scene_dir)
