@@ -125,6 +125,7 @@ python generate_viewpoint_pairs.py --scene_dir scannet_data --batch
 | `--output_dir` | `outputs` | Root directory for all outputs |
 | `--batch` | off | Process all `scene*` subdirs under `--scene_dir` |
 | `--skip_existing` | off | Skip any scene whose output directory already exists under `--output_dir` |
+| `--first_variant_only` | off | In batch mode, only process the first variant of each scene number (`sceneXXXX_00`), ignoring `_01`, `_02`, etc. |
 | `--min_object_volume` | `0.2` m³ | Skip objects smaller than this (removes clutter) |
 | `--min_centroid_distance` | `0.5` m | Minimum distance between object pair centroids |
 | `--max_centroid_distance` | `5.0` m | Maximum distance between object pair centroids |

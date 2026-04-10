@@ -1838,6 +1838,12 @@ def parse_args() -> argparse.Namespace:
         help="Skip scenes that already have an output directory in --output_dir.",
     )
     p.add_argument(
+        "--first_variant_only",
+        action="store_true",
+        default=False,
+        help="In batch mode, only process the first variant of each scene number (sceneXXXX_00), skipping _01, _02, etc.",
+    )
+    p.add_argument(
         "--log_level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -1884,6 +1890,7 @@ def main() -> None:
         scene_dirs = sorted(
             d for d in scene_dir.iterdir()
             if d.is_dir() and d.name.startswith("scene")
+            and (not args.first_variant_only or d.name.endswith("_00"))
         )
         log.info("Batch mode: found %d scene directories", len(scene_dirs))
         for sd in scene_dirs:
