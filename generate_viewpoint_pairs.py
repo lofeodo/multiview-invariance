@@ -56,7 +56,7 @@ DEFAULT_SKIP_LABELS = {
     "windowsill", "beam", "column", "pipe", "stair",
     "railing", "floor mat",
 }
-DEFAULT_MIN_OBJECT_VOLUME = 0.005   # m³
+DEFAULT_MIN_OBJECT_VOLUME = 0.2     # m³
 DEFAULT_MIN_CENTROID_DIST = 0.5     # m
 DEFAULT_MAX_CENTROID_DIST = 5.0     # m
 DEFAULT_STANDOFF_FACTOR = 1.5       # ×(centroid distance)
@@ -67,8 +67,8 @@ DEFAULT_FOV = 60.0                  # degrees
 DEFAULT_RES_W = 1024
 DEFAULT_RES_H = 768
 DEFAULT_MIN_PROJ_SIZE = 50          # pixels
-DEFAULT_OCCLUSION_THRESH = 0.20     # fraction of rays that must reach object
-DEFAULT_MAX_PAIRS = 20              # per scene
+DEFAULT_OCCLUSION_THRESH = 0.50     # fraction of rays that must reach object
+DEFAULT_MAX_PAIRS = 6               # per scene
 DEFAULT_NEAR_GEOM_DIST = 0.3        # m — camera collision threshold
 
 # ---------------------------------------------------------------------------
@@ -88,16 +88,19 @@ HIGHLIGHT_PALETTE: list[tuple[str, np.ndarray]] = [
 ]
 
 
-def assign_pair_colors(pair_index: int) -> tuple[str, np.ndarray, str, np.ndarray]:
-    """Return (name_a, rgb_a, name_b, rgb_b) for a given pair index.
+def assign_pair_colors(
+    pair_index: int,
+) -> tuple[str, np.ndarray, str, np.ndarray, str, np.ndarray]:
+    """Return (name_a, rgb_a, name_b, rgb_b, name_arrow, rgb_arrow) for a given pair index.
 
-    Even-indexed palette entries go to A, odd to B, cycling through the palette
-    so consecutive pairs always get different colours from one another.
+    Entries are drawn from HIGHLIGHT_PALETTE at offsets 0, 1, 2 (mod n) relative
+    to the pair's base index, so A, B, and the arrow are always distinct colours.
     """
     n = len(HIGHLIGHT_PALETTE)
-    name_a, rgb_a = HIGHLIGHT_PALETTE[(pair_index * 2) % n]
-    name_b, rgb_b = HIGHLIGHT_PALETTE[(pair_index * 2 + 1) % n]
-    return name_a, rgb_a.copy(), name_b, rgb_b.copy()
+    name_a, rgb_a       = HIGHLIGHT_PALETTE[(pair_index * 2)     % n]
+    name_b, rgb_b       = HIGHLIGHT_PALETTE[(pair_index * 2 + 1) % n]
+    name_sp, rgb_sp     = HIGHLIGHT_PALETTE[(pair_index * 2 + 2) % n]
+    return name_a, rgb_a.copy(), name_b, rgb_b.copy(), name_sp, rgb_sp.copy()
 
 
 # ---------------------------------------------------------------------------
@@ -309,37 +312,49 @@ def compute_spatial_relations(
     centroid_b_world: np.ndarray,
     w2c: np.ndarray,
     K: np.ndarray,
+    bbox_min_a: np.ndarray,
+    bbox_min_b: np.ndarray,
+    up_idx: int = 1,
     px_threshold: float = 20.0,
     depth_threshold: float = 0.1,
+    height_threshold: float = 0.1,
 ) -> dict:
     """Compute spatial relations between A and B as seen from the camera.
 
-    Left/right and above/below use projected pixel coordinates so they match
-    what is visually left/above in the rendered image (includes perspective
-    division). Front/behind uses camera-space z (depth).
+    Left/right uses projected pixel coordinates (image-plane x) so it matches
+    what is visually left in the rendered image (includes perspective division).
+    Front/behind uses camera-space z (depth).
+    Above/below requires BOTH: (1) A's centroid is higher than B's centroid by
+    at least height_threshold, AND (2) the bottom of A's bounding box is higher
+    than the bottom of B's bounding box by at least height_threshold.  Both
+    conditions use world-space up-axis coordinates so the result is independent
+    of camera perspective.
 
     Each axis has a dead zone: if the difference is smaller than the threshold,
     neither direction is true (both can be false, but both cannot be true).
 
-    px_threshold    : pixel dead zone for left/right and above/below (default 20 px)
+    up_idx          : world axis index for up (0=X, 1=Y, 2=Z)
+    px_threshold    : pixel dead zone for left/right (default 20 px)
     depth_threshold : metre dead zone for front/behind (default 0.1 m)
+    height_threshold: metre threshold for above/below centroid and bbox-bottom (default 0.1 m)
     """
     pts = world_to_cam(np.stack([centroid_a_world, centroid_b_world]), w2c)
     a_cam, b_cam = pts[0], pts[1]
     uv, _ = project_points(np.stack([centroid_a_world, centroid_b_world]), w2c, K)
     a_px, b_px = uv[0], uv[1]
 
-    dx = float(a_px[0] - b_px[0])
-    dy = float(a_px[1] - b_px[1])
-    dz = float(a_cam[2] - b_cam[2])
+    dx        = float(a_px[0] - b_px[0])
+    dz        = float(a_cam[2] - b_cam[2])
+    dh_cen    = float(centroid_a_world[up_idx] - centroid_b_world[up_idx])   # positive = A centroid higher
+    dh_bottom = float(bbox_min_a[up_idx]       - bbox_min_b[up_idx])         # positive = A bottom higher
 
     return {
         "A_left_of_B":     dx < -px_threshold,
         "A_right_of_B":    dx >  px_threshold,
         "A_in_front_of_B": dz < -depth_threshold,
         "A_behind_B":      dz >  depth_threshold,
-        "A_above_B":       dy < -px_threshold,   # y-down: smaller pixel-y is higher
-        "A_below_B":       dy >  px_threshold,
+        "A_above_B":       dh_cen >  height_threshold and dh_bottom >  height_threshold,
+        "A_below_B":       dh_cen < -height_threshold and dh_bottom < -height_threshold,
     }
 
 
@@ -484,6 +499,66 @@ def check_occlusion(
     hit_dist = hits["t_hit"].numpy()  # (N,)
 
     # A ray reaches the object if it hits at roughly the expected distance (±0.1m)
+    reached = np.sum(
+        (hit_dist >= expected_dist - 0.15) & (hit_dist < expected_dist + 0.15)
+    )
+    return float(reached) / len(targets)
+
+
+def check_occlusion_from_view(
+    scene: o3d.t.geometry.RaycastingScene,
+    camera_pos: np.ndarray,
+    object_vertices: np.ndarray,  # (k, 3) world coords
+    w2c: np.ndarray,
+    K: np.ndarray,
+    width: int,
+    height: int,
+    n_samples: int = 32,
+) -> float:
+    """Like check_occlusion, but restricts sampled vertices to those that
+    project within the camera's field of view.
+
+    This ensures the occlusion check only tests vertices that would actually
+    appear in the rendered image (in front of the camera and within the image
+    frame), rather than all vertices regardless of direction.  This is critical
+    for low camera positions (e.g. the arrow's viewpoint) where top/side
+    vertices can be unobstructed while the front-facing vertices visible in
+    the image are blocked by intermediate furniture.
+
+    Returns the fraction of in-frustum sampled vertices that are unobstructed,
+    or 0.0 if no object vertices project into the image frame.
+    """
+    if len(object_vertices) == 0:
+        return 0.0
+
+    # Keep only vertices in front of the camera and within the image bounds
+    pts_2d, depths = project_points(object_vertices, w2c, K)
+    in_frustum = (
+        (depths > 0.1)
+        & (pts_2d[:, 0] >= 0) & (pts_2d[:, 0] < width)
+        & (pts_2d[:, 1] >= 0) & (pts_2d[:, 1] < height)
+    )
+    frustum_verts = object_vertices[in_frustum]
+    if len(frustum_verts) == 0:
+        return 0.0
+
+    idx = np.random.choice(len(frustum_verts), size=min(n_samples, len(frustum_verts)), replace=False)
+    targets = frustum_verts[idx]
+
+    origins = np.tile(camera_pos.astype(np.float32), (len(targets), 1))
+    directions = targets.astype(np.float32) - origins
+    norms = np.linalg.norm(directions, axis=1, keepdims=True)
+    valid = (norms[:, 0] > 1e-4)
+    directions[valid] = directions[valid] / norms[valid]
+    expected_dist = norms[:, 0]
+
+    rays = o3d.core.Tensor(
+        np.hstack([origins, directions]).astype(np.float32),
+        dtype=o3d.core.Dtype.Float32,
+    )
+    hits = scene.cast_rays(rays)
+    hit_dist = hits["t_hit"].numpy()
+
     reached = np.sum(
         (hit_dist >= expected_dist - 0.15) & (hit_dist < expected_dist + 0.15)
     )
@@ -734,8 +809,25 @@ def _o3d_mesh_to_pyvista(mesh: o3d.geometry.TriangleMesh, override_colors: np.nd
     return pv_mesh
 
 
-def _pyvista_render(pv_mesh, w2c: np.ndarray, K: np.ndarray, width: int, height: int) -> np.ndarray:
-    """Render a PyVista mesh with the given camera and return (H, W, 3) uint8."""
+def _pyvista_render(
+    pv_mesh,
+    w2c: np.ndarray,
+    K: np.ndarray,
+    width: int,
+    height: int,
+    sphere_center: np.ndarray | None = None,
+    sphere_color: np.ndarray | None = None,
+    arrow_target: np.ndarray | None = None,
+    arrow_up: np.ndarray | None = None,
+) -> np.ndarray:
+    """Render a PyVista mesh with the given camera and return (H, W, 3) uint8.
+
+    If sphere_center, arrow_target, and arrow_up are provided, a flat arrow is
+    drawn at sphere_center pointing towards arrow_target.  The arrow is flat in
+    the plane spanned by its forward direction and the horizontal (right) axis,
+    so its thin dimension aligns with arrow_up (the floor normal of the arrow's
+    own camera pose).  The shaft is half the length used previously.
+    """
     import pyvista as pv
 
     position, focal_point, up_world, view_angle = _w2c_to_pyvista_camera(w2c, K, height)
@@ -743,6 +835,90 @@ def _pyvista_render(pv_mesh, w2c: np.ndarray, K: np.ndarray, width: int, height:
     plotter = pv.Plotter(off_screen=True, window_size=[width, height])
     plotter.set_background("black")
     plotter.add_mesh(pv_mesh, scalars="RGB", rgb=True, show_scalar_bar=False)
+
+    if sphere_center is not None and arrow_target is not None and arrow_up is not None:
+        direction = arrow_target - sphere_center
+        length = float(np.linalg.norm(direction))
+        if length > 1e-6:
+            forward = direction / length
+
+            # Build an orthonormal frame: X=forward, Y=up_perp, Z=right.
+            # The arrow is created pointing along canonical +X, then squashed in
+            # canonical Y (→ up_perp after rotation) to make it flat, then
+            # rotated into world space and translated to sphere_center.
+            right = np.cross(forward, arrow_up)
+            right_norm = np.linalg.norm(right)
+            if right_norm < 1e-6:
+                # Degenerate: arrow points straight up/down — pick any perp axis
+                alt = np.array([1.0, 0.0, 0.0]) if abs(forward[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+                right = np.cross(forward, alt)
+                right = right / np.linalg.norm(right)
+            else:
+                right = right / right_norm
+            up_perp = np.cross(right, forward)  # orthogonal to both, ≈ arrow_up
+
+            # Rotation matrix mapping canonical axes to world axes
+            R = np.column_stack([forward, up_perp, right])  # (3, 3)
+
+            # Build a flat extruded arrow: rectangular shaft + triangular tip,
+            # extruded along canonical Y (→ world up_perp).
+            #
+            # Size the arrow so it spans a fixed fraction of image height in
+            # screen space, regardless of zoom level.  The perspective formula:
+            #   screen_fraction = world_size / (2 * dist * tan(fov/2))
+            # Solving for world_size gives:
+            #   s = target_fraction * 2 * dist_to_cam * tan(fov/2)
+            dist_to_cam = float(np.linalg.norm(np.array(position) - sphere_center))
+            fov_rad     = np.radians(view_angle)
+            s = 0.2 * dist_to_cam * 2.0 * np.tan(fov_rad / 2.0)
+            s = min(s, length * 0.8)  # don't overshoot the target object
+            tip_x    = s * 0.6      # shaft/tip junction (tip_length=0.4)
+            shaft_hw = s * 0.04     # shaft half-width in right direction
+            tip_hw   = s * 0.10     # tip base half-width in right direction
+            half_t   = s * 0.03     # extrusion half-thickness in up_perp direction
+
+            # 7-vertex arrow outline in canonical XZ plane (forward=+X, right=+Z).
+            # Listed CCW when viewed from +Y so front-face normal points +Y.
+            profile = np.array([
+                [0,      -shaft_hw],
+                [tip_x,  -shaft_hw],
+                [tip_x,  -tip_hw],
+                [s,       0.0],
+                [tip_x,   tip_hw],
+                [tip_x,   shaft_hw],
+                [0,       shaft_hw],
+            ])
+            nv = len(profile)  # 7
+
+            # Front vertices at y=+half_t, back vertices at y=-half_t
+            front = np.column_stack([profile[:, 0], np.full(nv,  half_t), profile[:, 1]])
+            back  = np.column_stack([profile[:, 0], np.full(nv, -half_t), profile[:, 1]])
+            verts = np.vstack([front, back]).astype(np.float64)
+
+            # Manually triangulate to avoid VTK mishandling the concave arrow polygon.
+            # The profile is split at the shaft/tip junction (vertices 1 and 5):
+            #   shaft rectangle: verts 0,1,5,6  →  2 triangles
+            #   tip pentagon:    verts 1,2,3,4,5 → 3 triangles
+            # Back face uses same decomposition with reversed winding (+nv offset).
+            # Side faces: each edge becomes 2 triangles.
+            faces = []
+            # Front face (CCW from +Y)
+            faces += [[3,0,1,5], [3,0,5,6]]            # shaft
+            faces += [[3,1,2,3], [3,1,3,4], [3,1,4,5]] # tip
+            # Back face (reversed winding → normal points -Y)
+            faces += [[3,0+nv,5+nv,1+nv], [3,0+nv,6+nv,5+nv]]
+            faces += [[3,1+nv,3+nv,2+nv], [3,1+nv,4+nv,3+nv], [3,1+nv,5+nv,4+nv]]
+            # Side faces (2 triangles per edge)
+            for i in range(nv):
+                j = (i + 1) % nv
+                faces += [[3, i, j, j + nv], [3, i, j + nv, i + nv]]
+
+            arrow_mesh = pv.PolyData(verts, np.hstack(faces))
+
+            # Rotate into world space and translate to the arrow's position
+            arrow_mesh.points = (R @ arrow_mesh.points.T).T + sphere_center
+
+            plotter.add_mesh(arrow_mesh, color=np.clip(sphere_color, 0.0, 1.0).tolist())
 
     plotter.camera.position = position.tolist()
     plotter.camera.focal_point = focal_point.tolist()
@@ -767,12 +943,20 @@ def render_scene(
     inst_b: dict | None = None,
     color_a_rgb: np.ndarray | None = None,
     color_b_rgb: np.ndarray | None = None,
+    sphere_center: np.ndarray | None = None,
+    sphere_color: np.ndarray | None = None,
+    arrow_target: np.ndarray | None = None,
+    arrow_up: np.ndarray | None = None,
 ) -> np.ndarray:
     """Render the scene using PyVista (VTK-based, Windows headless compatible).
 
     When inst_a/inst_b and their colours are supplied, object A and B are
     rendered in their assigned highlight colours; everything else is converted
     to perceptual grayscale.
+
+    When sphere_center, arrow_target, and arrow_up are provided, a flat arrow
+    is rendered at sphere_center pointing towards arrow_target, flattened
+    perpendicular to arrow_up (the floor normal of the arrow's camera pose).
 
     Returns (H, W, 3) uint8 RGB array.
     """
@@ -781,7 +965,7 @@ def render_scene(
         pv_mesh = _o3d_mesh_to_pyvista(mesh, override_colors=override)
     else:
         pv_mesh = _o3d_mesh_to_pyvista(mesh)
-    return _pyvista_render(pv_mesh, w2c, K, width, height)
+    return _pyvista_render(pv_mesh, w2c, K, width, height, sphere_center=sphere_center, sphere_color=sphere_color, arrow_target=arrow_target, arrow_up=arrow_up)
 
 
 def render_instance_mask(
@@ -851,6 +1035,280 @@ def detect_up_axis(axis_mat: np.ndarray, vertices: np.ndarray) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Arrow placement
+# ---------------------------------------------------------------------------
+
+def _point_inside_any_instance(
+    pos: np.ndarray,
+    instances: list[dict],
+    margin: float = 0.05,
+) -> bool:
+    """Return True if pos falls inside the axis-aligned bounding box of any instance.
+
+    A small margin is added to each bbox to catch points that are on or just
+    outside a surface but would still cause the arrow to appear embedded.
+    """
+    for inst in instances:
+        lo = inst["bbox_min"] - margin
+        hi = inst["bbox_max"] + margin
+        if np.all(pos >= lo) and np.all(pos <= hi):
+            return True
+    return False
+
+
+def _arrow_unblocked_fraction(
+    scene_rc: o3d.t.geometry.RaycastingScene,
+    eye: np.ndarray,
+    samples: np.ndarray,
+    tolerance: float = 0.05,
+) -> float:
+    """Return the fraction of sample points reachable from eye without obstruction.
+
+    Unlike check_occlusion (which expects rays to *hit* a mesh surface at the
+    target), this is an open-space check: a sample is unblocked if no mesh
+    surface intersects the ray *before* it reaches the sample point.  This is
+    the correct test for arrow points that exist in free space rather than on
+    any mesh.
+    """
+    origins    = np.tile(eye.astype(np.float32), (len(samples), 1))
+    targets    = samples.astype(np.float32)
+    directions = targets - origins
+    dists      = np.linalg.norm(directions, axis=1)
+    valid      = dists > 1e-6
+    directions[valid] = directions[valid] / dists[valid, np.newaxis]
+
+    rays = o3d.core.Tensor(
+        np.hstack([origins, directions]).astype(np.float32),
+        dtype=o3d.core.Dtype.Float32,
+    )
+    hit_dists = scene_rc.cast_rays(rays)["t_hit"].numpy()
+    unblocked = hit_dists >= (dists - tolerance)
+    return float(np.sum(unblocked)) / len(samples)
+
+
+def _arrow_visible_from_viewpoint(
+    scene_rc: o3d.t.geometry.RaycastingScene,
+    vp: dict,
+    arrow_pos: np.ndarray,
+    arrow_target: np.ndarray,
+    K: np.ndarray,
+    width: int,
+    height: int,
+    arrow_occlusion_thresh: float,
+    arrow_scale: float = 0.25,
+) -> bool:
+    """Return True if the arrow is sufficiently visible from the given viewpoint.
+
+    Samples five points along the arrow (base, quarter, mid, three-quarter,
+    near-tip).  All must be in front of the camera, the fraction of unblocked
+    lines-of-sight must meet arrow_occlusion_thresh (open-space raycasting via
+    _arrow_unblocked_fraction), and all samples must project within the image
+    frame.
+    """
+    eye     = vp["eye"]
+    w2c     = vp["w2c"]
+    forward = w2c[2, :3]
+
+    direction = arrow_target - arrow_pos
+    length = float(np.linalg.norm(direction))
+    if length < 1e-6:
+        return False
+    direction_unit = direction / length
+    scale = min(length, arrow_scale)
+
+    # Five sample points distributed along the arrow
+    samples = np.array([
+        arrow_pos,
+        arrow_pos + direction_unit * scale * 0.25,
+        arrow_pos + direction_unit * scale * 0.50,
+        arrow_pos + direction_unit * scale * 0.75,
+        arrow_pos + direction_unit * scale * 0.95,
+    ])
+
+    # 1. All samples must be in front of the camera
+    for pt in samples:
+        if float(np.dot(pt - eye, forward)) <= 0.0:
+            return False
+
+    # 2. Open-space occlusion: fraction of sample rays that reach the arrow
+    #    unblocked must meet arrow_occlusion_thresh
+    if _arrow_unblocked_fraction(scene_rc, eye, samples) < arrow_occlusion_thresh:
+        return False
+
+    # 3. All samples must project within the image frame
+    pts_2d, depths = project_points(samples, w2c, K)
+    return all(
+        d > 0.1 and 0 <= u < width and 0 <= v < height
+        for (u, v), d in zip(pts_2d, depths)
+    )
+
+
+def find_arrow_position(
+    scene_rc: o3d.t.geometry.RaycastingScene,
+    viewpoints: list[dict],
+    rels: list[dict],
+    ca: np.ndarray,
+    cb: np.ndarray,
+    inst_a: dict,
+    inst_b: dict,
+    instances: list[dict],
+    floor_y: float,
+    up_idx: int,
+    vertices: np.ndarray,
+    K: np.ndarray,
+    width: int,
+    height: int,
+    occlusion_thresh: float,
+    min_proj_size: int,
+    arrow_occlusion_thresh: float = 0.8,
+    arrow_radius: float = 0.08,
+    arrow_height_above_floor: float = 0.7,
+    n_random: int = 300,
+    min_visible: int = 2,
+) -> tuple[np.ndarray | None, list[dict], list[dict]]:
+    """Find a world position for the arrow visible from at least min_visible viewpoints.
+
+    Constraints per candidate:
+    - Not clipping into scene mesh geometry.
+    - Not inside any instance bounding box.
+    - Both highlighted objects visible (occlusion + frustum) from the arrow's pose.
+    - Arrow visible (occlusion + frustum) from at least min_visible viewpoints.
+
+    A per-object minimum distance is enforced: the arrow must be at least
+    dist(arrow, centroid_X) >= longest_bbox_dim_of_X for each object X,
+    so the arrow is never placed visually on top of or inside either object.
+
+    Candidates are drawn from several complementary heuristics, ordered so that
+    the most geometrically informed ones are tried first:
+
+    1. Viewpoint-projection: project each validated viewpoint's eye onto the
+       arrow height plane.  These positions are almost certain to see both
+       objects clearly.
+    2. Viewpoint neighbourhood: small radius offsets around each projected eye.
+    3. Dense angular sweep around the midpoint at many radii (0.3 m – 5 m).
+    4. Dense angular sweeps centred on each object's centroid.
+    5. Midpoint between every pair of viewpoints (projected to arrow height).
+    6. Random uniform fallback within the scene bounding box.
+
+    Returns (arrow_pos, visible_viewpoints, visible_rels) — or (None, [], [])
+    if no suitable position is found.
+    """
+    arrow_target = (ca + cb) / 2.0
+    arrow_h = floor_y + arrow_height_above_floor
+
+    ground_axes = [a for a in (0, 1, 2) if a != up_idx]
+    h0, h1 = ground_axes
+
+    midpoint = (ca + cb) / 2.0
+
+    min_dist_a = float(np.max(inst_a["bbox_max"] - inst_a["bbox_min"]))
+    min_dist_b = float(np.max(inst_b["bbox_max"] - inst_b["bbox_min"]))
+
+    lo0 = float(np.percentile(vertices[:, h0], 10))
+    hi0 = float(np.percentile(vertices[:, h0], 90))
+    lo1 = float(np.percentile(vertices[:, h1], 10))
+    hi1 = float(np.percentile(vertices[:, h1], 90))
+
+    def _at_arrow_h(pt: np.ndarray) -> np.ndarray:
+        p = pt.copy(); p[up_idx] = arrow_h; return p
+
+    candidates: list[np.ndarray] = []
+
+    # --- Heuristic 1: project each viewpoint eye onto the arrow height plane ---
+    # These are strong candidates because the objects are already known to be
+    # visible from nearby positions at camera height.
+    for vp in viewpoints:
+        candidates.append(_at_arrow_h(vp["eye"]))
+
+    # --- Heuristic 2: neighbourhood around each projected viewpoint eye ---
+    for vp in viewpoints:
+        base = _at_arrow_h(vp["eye"])
+        for r in (0.3, 0.6, 1.0, 1.5):
+            for angle_deg in np.linspace(0, 360, 8, endpoint=False):
+                a = np.radians(angle_deg)
+                d = np.zeros(3)
+                d[h0] = np.cos(a) * r
+                d[h1] = np.sin(a) * r
+                candidates.append(_at_arrow_h(base + d))
+
+    # --- Heuristic 3: midpoint between every pair of viewpoints ---
+    vp_eyes = [_at_arrow_h(vp["eye"]) for vp in viewpoints]
+    for i in range(len(vp_eyes)):
+        for j in range(i + 1, len(vp_eyes)):
+            candidates.append(((vp_eyes[i] + vp_eyes[j]) / 2.0).copy())
+            # Also try 1/3 and 2/3 along the segment
+            candidates.append(_at_arrow_h(vp_eyes[i] * 2/3 + vp_eyes[j] * 1/3))
+            candidates.append(_at_arrow_h(vp_eyes[i] * 1/3 + vp_eyes[j] * 2/3))
+
+    # --- Heuristic 4: dense angular sweep from three ground-plane centres ---
+    sweep_radii = (0.3, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0)
+    sweep_angles = np.linspace(0, 360, 24, endpoint=False)
+    for centre in (midpoint, ca, cb):
+        for r in sweep_radii:
+            for angle_deg in sweep_angles:
+                a = np.radians(angle_deg)
+                d = np.zeros(3)
+                d[h0] = np.cos(a) * r
+                d[h1] = np.sin(a) * r
+                candidates.append(_at_arrow_h(centre + d))
+
+    # --- Heuristic 5: random uniform fallback ---
+    for _ in range(n_random):
+        pt = np.zeros(3)
+        pt[h0]     = np.random.uniform(lo0, hi0)
+        pt[h1]     = np.random.uniform(lo1, hi1)
+        pt[up_idx] = arrow_h
+        candidates.append(pt)
+
+    # Evaluate each candidate
+    for pos in candidates:
+        # Arrow must be at least as far from each object's centroid as that
+        # object's longest bounding-box dimension.
+        if float(np.linalg.norm(pos - ca)) < min_dist_a:
+            continue
+        if float(np.linalg.norm(pos - cb)) < min_dist_b:
+            continue
+
+        # Must not clip into scene mesh geometry
+        if nearest_geometry_distance(scene_rc, pos) < arrow_radius:
+            continue
+
+        # Must not be inside any instance's bounding box
+        if _point_inside_any_instance(pos, instances):
+            continue
+
+        # Both highlighted objects must be sufficiently visible from the arrow's
+        # own pose. Use frustum-filtered occlusion: only test vertices that
+        # project within the camera frame, matching what the rendered image
+        # will actually show.
+        world_up_vec = np.zeros(3); world_up_vec[up_idx] = 1.0
+        w2c_cand = look_at_matrix(pos, arrow_target, world_up_vec)
+        if check_occlusion_from_view(scene_rc, pos, vertices[inst_a["vertex_indices"]], w2c_cand, K, width, height) < occlusion_thresh:
+            continue
+        if check_occlusion_from_view(scene_rc, pos, vertices[inst_b["vertex_indices"]], w2c_cand, K, width, height) < occlusion_thresh:
+            continue
+        if not objects_in_frustum(inst_a["centroid"], inst_a["bbox_min"], inst_a["bbox_max"], w2c_cand, K, width, height, min_proj_size):
+            continue
+        if not objects_in_frustum(inst_b["centroid"], inst_b["bbox_min"], inst_b["bbox_max"], w2c_cand, K, width, height, min_proj_size):
+            continue
+
+        visible_vps:  list[dict] = []
+        visible_rels: list[dict] = []
+        for vp, rel in zip(viewpoints, rels):
+            if _arrow_visible_from_viewpoint(
+                scene_rc, vp, pos, arrow_target,
+                K, width, height, arrow_occlusion_thresh,
+            ):
+                visible_vps.append(vp)
+                visible_rels.append(rel)
+
+        if len(visible_vps) >= min_visible:
+            return pos, visible_vps, visible_rels
+
+    return None, [], []
+
+
+# ---------------------------------------------------------------------------
 # Main scene processing
 # ---------------------------------------------------------------------------
 
@@ -874,10 +1332,19 @@ def process_scene(
     max_pairs: int,
     near_geom_dist: float,
     full_colour: bool = False,
+    reference_object: bool = False,
+    print_reference_image: bool = False,
+    arrow_occlusion_thresh: float = 0.8,
+    verbose_output: bool = False,
+    skip_existing: bool = False,
 ) -> None:
     """Process a single ScanNet scene directory."""
     scene_id = scene_dir.name
     log.info("=== Processing scene: %s ===", scene_id)
+
+    if skip_existing and (output_dir / scene_id).exists():
+        log.info("Scene %s already in output — skipping", scene_id)
+        return
 
     # Locate files
     ply_path = scene_dir / f"{scene_id}_vh_clean_2.ply"
@@ -932,9 +1399,7 @@ def process_scene(
     # Output dirs
     scene_out = output_dir / scene_id
     img_dir = scene_out / "images"
-    vp_dir = output_dir / "viewpoints" / f"scene{scene_id.replace('scene', '')}"
     img_dir.mkdir(parents=True, exist_ok=True)
-    vp_dir.mkdir(parents=True, exist_ok=True)
 
     # Enumerate pairs
     all_pairs = list(combinations(range(len(instances)), 2))
@@ -963,8 +1428,8 @@ def process_scene(
             pair_id, inst_a["label"], inst_b["label"], dist,
         )
 
-        # Assign highlight colours for this pair
-        color_name_a, color_rgb_a, color_name_b, color_rgb_b = assign_pair_colors(pair_color_index)
+        # Assign highlight colours for this pair (A, B, and optional sphere)
+        color_name_a, color_rgb_a, color_name_b, color_rgb_b, color_name_sp, color_rgb_sp = assign_pair_colors(pair_color_index)
 
         # Compute candidate camera positions
         candidates = compute_camera_candidates(
@@ -1010,7 +1475,9 @@ def process_scene(
 
         # Compute spatial relations for all valid viewpoints
         rels = [
-            compute_spatial_relations(ca, cb, vp["w2c"], K)
+            compute_spatial_relations(ca, cb, vp["w2c"], K,
+                                      inst_a["bbox_min"], inst_b["bbox_min"],
+                                      up_idx=up_axis)
             for vp in valid_viewpoints
         ]
 
@@ -1029,14 +1496,12 @@ def process_scene(
             log.info("  No relation flip detected — skipping pair")
             continue
 
-        # Cap at 3 viewpoints (prefer the flip pair + one diagonal)
-        # Ensure we keep viewpoints from both sides of the flip
+        # Keep exactly 2 viewpoints (one from each side of the flip)
         selected_vps: list[dict] = []
         selected_rels: list[dict] = []
-        # Keep at most one from each "side" (perp_pos/perp_neg, along_pos/along_neg)
         seen_sides = set()
         for vp, rel in zip(valid_viewpoints, rels):
-            if len(selected_vps) >= 3:
+            if len(selected_vps) >= 2:
                 break
             side_key = vp["label"]
             if side_key not in seen_sides:
@@ -1047,6 +1512,99 @@ def process_scene(
         if len(selected_vps) < 2:
             continue
 
+        # Find an arrow position visible from at least 2 of the selected viewpoints.
+        # Viewpoint selection is done first (independent of the arrow); arrow
+        # placement is solved afterwards with structured heuristics + random
+        # sampling, using the same occlusion raycasting as for the objects.
+        sphere_pos: np.ndarray | None = None
+        if reference_object:
+            sphere_pos, arrow_vps, arrow_rels = find_arrow_position(
+                scene_rc, selected_vps, selected_rels, ca, cb,
+                inst_a, inst_b, instances,
+                floor_y, up_axis, vertices, K, width, height, occlusion_thresh, min_proj_size,
+                arrow_occlusion_thresh=arrow_occlusion_thresh,
+            )
+            if sphere_pos is None:
+                log.info(
+                    "  Pair %s: no arrow position visible from 2+ viewpoints — skipping pair",
+                    pair_id,
+                )
+                continue
+            selected_vps  = arrow_vps
+            selected_rels = arrow_rels
+
+            # Re-check that a relation flip still holds among the viewpoints that
+            # can see the arrow (filtering may have dropped one side of the flip).
+            flipped = []
+            r0 = selected_rels[0]
+            for ri in selected_rels[1:]:
+                if ri["A_left_of_B"] != r0["A_left_of_B"] or ri["A_right_of_B"] != r0["A_right_of_B"]:
+                    if "left_right" not in flipped:
+                        flipped.append("left_right")
+                if ri["A_in_front_of_B"] != r0["A_in_front_of_B"] or ri["A_behind_B"] != r0["A_behind_B"]:
+                    if "front_behind" not in flipped:
+                        flipped.append("front_behind")
+            if not flipped:
+                log.info("  Pair %s: arrow-visibility filtering removed the flip — skipping pair", pair_id)
+                continue
+
+        # World-up vector used for the arrow's flat orientation (floor normal)
+        world_up_vec = np.zeros(3); world_up_vec[up_axis] = 1.0
+
+        # Arrow-perspective spatial relations and optional reference image
+        arrow_target_pos: np.ndarray | None = None
+        arrow_spatial_rels: dict | None = None
+        arrow_image_path: str | None = None
+        arrow_pose: dict | None = None
+        if sphere_pos is not None:
+            arrow_target_pos = (ca + cb) / 2.0
+            w2c_arrow = look_at_matrix(sphere_pos, arrow_target_pos, world_up_vec)
+            arrow_spatial_rels = compute_spatial_relations(ca, cb, w2c_arrow, K,
+                                                           inst_a["bbox_min"], inst_b["bbox_min"],
+                                                           up_idx=up_axis)
+
+            # Pose description: position, forward/right/up axes, and the world-up
+            # convention used (camera up = world up = floor normal).
+            forward_vec = (arrow_target_pos - sphere_pos)
+            forward_vec = forward_vec / np.linalg.norm(forward_vec)
+            right_vec   = np.cross(forward_vec, world_up_vec)
+            right_norm  = np.linalg.norm(right_vec)
+            if right_norm > 1e-6:
+                right_vec = right_vec / right_norm
+            else:
+                # Degenerate case: arrow points straight up/down — fall back to x-axis
+                right_vec = np.array([1.0, 0.0, 0.0])
+                right_vec[up_axis] = 0.0
+                right_vec = right_vec / np.linalg.norm(right_vec)
+            up_vec = np.cross(right_vec, forward_vec)
+
+            arrow_pose = {
+                "position_world":  [round(float(v), 4) for v in sphere_pos],
+                "forward_world":   [round(float(v), 4) for v in forward_vec],
+                "right_world":     [round(float(v), 4) for v in right_vec],
+                "up_world":        [round(float(v), 4) for v in up_vec],
+                "up_convention":   "world_up — camera up-axis is aligned with the floor normal (axis %d)" % up_axis,
+                "w2c_matrix":      [[round(float(v), 6) for v in row] for row in w2c_arrow.tolist()],
+                "fov_degrees":     fov,
+                "image_resolution": [width, height],
+            }
+
+            if print_reference_image:
+                arrow_img_name = f"objA_{inst_a['instance_id']}_objB_{inst_b['instance_id']}_view_arrow.png"
+                arrow_img_path = img_dir / arrow_img_name
+                try:
+                    rgb_arrow = render_scene(
+                        mesh, w2c_arrow, K, width, height,
+                        inst_a=None if full_colour else inst_a,
+                        inst_b=None if full_colour else inst_b,
+                        color_a_rgb=None if full_colour else color_rgb_a,
+                        color_b_rgb=None if full_colour else color_rgb_b,
+                    )
+                    Image.fromarray(rgb_arrow).save(str(arrow_img_path))
+                    arrow_image_path = f"images/{arrow_img_name}"
+                except Exception as exc:
+                    log.warning("  Arrow-view render failed: %s", exc)
+
         # Render images and compute 2D bboxes
         viewpoint_records: list[dict] = []
         any_render_failed = False
@@ -1054,7 +1612,6 @@ def process_scene(
         for vi, (vp, rel) in enumerate(zip(selected_vps, selected_rels)):
             img_name = f"objA_{inst_a['instance_id']}_objB_{inst_b['instance_id']}_view_{vi}.png"
             img_path = img_dir / img_name
-            vp_img_path = vp_dir / img_name
 
             try:
                 rgb = render_scene(
@@ -1063,9 +1620,12 @@ def process_scene(
                     inst_b=None if full_colour else inst_b,
                     color_a_rgb=None if full_colour else color_rgb_a,
                     color_b_rgb=None if full_colour else color_rgb_b,
+                    sphere_center=sphere_pos,
+                    sphere_color=color_rgb_sp if sphere_pos is not None else None,
+                    arrow_target=(ca + cb) / 2.0 if sphere_pos is not None else None,
+                    arrow_up=world_up_vec if sphere_pos is not None else None,
                 )
                 Image.fromarray(rgb).save(str(img_path))
-                Image.fromarray(rgb).save(str(vp_img_path))
             except Exception as exc:
                 log.warning("  Render failed for viewpoint %d: %s", vi, exc)
                 any_render_failed = True
@@ -1112,15 +1672,28 @@ def process_scene(
                     (ca + cb) / 2.0,
                 )
 
+            # Yaw misalignment between the camera's facing direction and the
+            # arrow's facing direction, both projected onto the horizontal plane.
+            # 0° = camera and arrow face the same way; 180° = they face opposite ways.
+            yaw_to_arrow: float | None = None
+            if sphere_pos is not None:
+                h0, h1 = [a for a in (0, 1, 2) if a != up_axis]
+                midpoint = (ca + cb) / 2.0
+                cam_fwd   = (vp["target"] - vp["eye"]).copy();   cam_fwd[up_axis]   = 0.0
+                arrow_fwd = (midpoint     - sphere_pos).copy();  arrow_fwd[up_axis] = 0.0
+                angle_cam   = math.atan2(float(cam_fwd[h1]),   float(cam_fwd[h0]))
+                angle_arrow = math.atan2(float(arrow_fwd[h1]), float(arrow_fwd[h0]))
+                yaw = math.degrees(angle_arrow - angle_cam)
+                yaw_to_arrow = round((yaw + 180.0) % 360.0 - 180.0, 2)
+
             viewpoint_records.append(
                 {
                     "viewpoint_index": vi,
                     "image_path": f"images/{img_name}",
-                    "fov_degrees": fov,
-                    "image_resolution": [width, height],
+                    **({"fov_degrees": fov, "image_resolution": [width, height], "viewpoint_label": vp["label"]} if verbose_output else {}),
                     "spatial_relations": rel,
-                    "viewpoint_label": vp["label"],
                     "angular_sep_from_view0_deg": round(ang_sep, 2),
+                    "yaw_to_arrow": yaw_to_arrow,
                 }
             )
 
@@ -1133,22 +1706,30 @@ def process_scene(
             (ca + cb) / 2.0,
         )
 
+        def _obj_entry(label, color_name, color_rgb):
+            d = {"instance_id": label["instance_id"], "label": label["label"], "color": color_name}
+            if verbose_output:
+                d["color_rgb"] = [round(float(v), 3) for v in color_rgb]
+            return d
+
+        arrow_entry = {}
+        if reference_object:
+            arrow_entry = {
+                "color": color_name_sp,
+                "spatial_relations_from_arrow": arrow_spatial_rels,
+                **({"image_path": arrow_image_path} if arrow_image_path is not None else {}),
+            }
+            if verbose_output:
+                arrow_entry["color_rgb"] = [round(float(v), 3) for v in color_rgb_sp]
+                arrow_entry["pose"] = arrow_pose
+
         group = {
             "pair_id": pair_id,
-            "object_A": {
-                "instance_id": inst_a["instance_id"],
-                "label": inst_a["label"],
-                "color": color_name_a,
-                "color_rgb": [round(float(v), 3) for v in color_rgb_a],
-            },
-            "object_B": {
-                "instance_id": inst_b["instance_id"],
-                "label": inst_b["label"],
-                "color": color_name_b,
-                "color_rgb": [round(float(v), 3) for v in color_rgb_b],
-            },
+            "object_A": _obj_entry(inst_a, color_name_a, color_rgb_a),
+            "object_B": _obj_entry(inst_b, color_name_b, color_rgb_b),
+            **({"reference_object_arrow": arrow_entry} if reference_object else {}),
             "viewpoints": viewpoint_records,
-            "flipped_relations": flipped,
+            **({"flipped_relations": flipped} if verbose_output else {}),
             "viewpoint_angular_separation_degrees": round(overall_ang, 2),
         }
         viewpoint_groups.append(group)
@@ -1161,9 +1742,9 @@ def process_scene(
     # Save metadata JSON
     metadata = {
         "scene_id": scene_id,
-        "axis_alignment_applied": True,
+        **({"axis_alignment_applied": True} if verbose_output else {}),
         "up_axis": ["X", "Y", "Z"][up_axis],
-        "camera_conventions": "OpenCV (x-right, y-down, z-forward)",
+        **({"camera_conventions": "OpenCV (x-right, y-down, z-forward)"} if verbose_output else {}),
         "viewpoint_groups": viewpoint_groups,
     }
     meta_path = scene_out / "metadata.json"
@@ -1225,7 +1806,43 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Render in original scene colours without highlighting objects or converting to grayscale.",
     )
+    p.add_argument(
+        "--reference-object",
+        action="store_true",
+        default=False,
+        help="Add a coloured arrow pointing toward the midpoint between the two highlighted objects, placed at a position visible from at least 2 viewpoints.",
+    )
+    p.add_argument(
+        "--print-reference-image",
+        action="store_true",
+        default=False,
+        help="Render an additional image from the arrow's viewpoint and save it as objA_x_objB_y_view_arrow.png. Requires --reference-object.",
+    )
+    p.add_argument(
+        "--max-arrow-occlusion",
+        type=float,
+        default=0.8,
+        help="Minimum fraction of arrow sample rays that must reach the arrow unblocked (0–1). Default 0.8 = 80%% visible.",
+    )
+    p.add_argument(
+        "--verbose_output",
+        action="store_true",
+        default=False,
+        help="Include all technical fields in the metadata JSON (axis_alignment_applied, camera_conventions, color_rgb, pose, flipped_relations). Off by default.",
+    )
     p.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    p.add_argument(
+        "--skip_existing",
+        action="store_true",
+        default=False,
+        help="Skip scenes that already have an output directory in --output_dir.",
+    )
+    p.add_argument(
+        "--first_variant_only",
+        action="store_true",
+        default=False,
+        help="In batch mode, only process the first variant of each scene number (sceneXXXX_00), skipping _01, _02, etc.",
+    )
     p.add_argument(
         "--log_level",
         default="INFO",
@@ -1258,6 +1875,11 @@ def main() -> None:
         max_pairs=args.max_pairs_per_scene,
         near_geom_dist=args.near_geom_dist,
         full_colour=args.full_colour,
+        reference_object=args.reference_object,
+        print_reference_image=args.print_reference_image,
+        arrow_occlusion_thresh=args.max_arrow_occlusion,
+        verbose_output=args.verbose_output,
+        skip_existing=args.skip_existing,
     )
 
     scene_dir = Path(args.scene_dir)
@@ -1268,6 +1890,7 @@ def main() -> None:
         scene_dirs = sorted(
             d for d in scene_dir.iterdir()
             if d.is_dir() and d.name.startswith("scene")
+            and (not args.first_variant_only or d.name.endswith("_00"))
         )
         log.info("Batch mode: found %d scene directories", len(scene_dirs))
         for sd in scene_dirs:
