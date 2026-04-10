@@ -57,7 +57,7 @@ Each scene directory (e.g. `scannet_data/scene0000_00/`) contains:
 
 ### 1. `download_scenes.py` — Download ScanNet scenes
 
-Download specific scenes by ID, a range starting from scene 0, or all scenes.
+Download specific scenes by ID, a contiguous range, or all scenes. `--scenes`, `--upto`, and `--from` are mutually exclusive.
 
 ```bash
 # Download a specific set of scenes
@@ -65,6 +65,9 @@ python download_scenes.py --scenes 0 1 2
 
 # Download the first N scenes (scene0000_00 through scene000N-1_00)
 python download_scenes.py --upto 10
+
+# Download scene N and every subsequent scene
+python download_scenes.py --from 210
 
 # Download all scenes
 python download_scenes.py
@@ -121,6 +124,7 @@ python generate_viewpoint_pairs.py --scene_dir scannet_data --batch
 | `--scene_dir` | *(required)* | Path to a scene dir, or root dir when using `--batch` |
 | `--output_dir` | `outputs` | Root directory for all outputs |
 | `--batch` | off | Process all `scene*` subdirs under `--scene_dir` |
+| `--skip_existing` | off | Skip any scene whose output directory already exists under `--output_dir` |
 | `--min_object_volume` | `0.2` m³ | Skip objects smaller than this (removes clutter) |
 | `--min_centroid_distance` | `0.5` m | Minimum distance between object pair centroids |
 | `--max_centroid_distance` | `5.0` m | Maximum distance between object pair centroids |
@@ -305,6 +309,7 @@ Spatial relations in `spatial_relations_from_arrow` follow the same conventions 
 # 1. Download scenes (specific, range, or all)
 python download_scenes.py --scenes 0 1 2  # specific
 python download_scenes.py --upto 10       # first 10
+python download_scenes.py --from 210      # scene 210 and onwards
 python download_scenes.py                 # all
 
 # 2. (Optional) visually inspect one
@@ -315,9 +320,10 @@ python generate_viewpoint_pairs.py \
     --scene_dir scannet_data/scene0000_00 \
     --reference-object --print-reference-image
 
-# 4. Batch-process everything downloaded
+# 4. Batch-process everything downloaded, skipping scenes already processed
 python generate_viewpoint_pairs.py \
     --scene_dir scannet_data --batch \
     --max_pairs_per_scene 30 \
-    --reference-object --print-reference-image
+    --reference-object --print-reference-image \
+    --skip_existing
 ```
