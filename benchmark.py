@@ -131,9 +131,11 @@ class LLaVAAdapter(ModelAdapter):
             sys.exit("transformers/torch not installed. Run: pip install transformers torch")
         import torch
         from transformers import LlavaNextForConditionalGeneration, LlavaNextProcessor
+        from transformers import BitsAndBytesConfig
+        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
         self._processor = LlavaNextProcessor.from_pretrained(model_id)
         self._model_obj = LlavaNextForConditionalGeneration.from_pretrained(
-            model_id, torch_dtype=torch.float16, device_map="auto",
+            model_id, quantization_config=bnb_config, device_map="auto",
         )
 
     def query(self, image_path: Path, prompt: str) -> str:
@@ -161,8 +163,10 @@ class QwenAdapter(ModelAdapter):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
         self._tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        from transformers import BitsAndBytesConfig
+        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
         self._model_obj = AutoModelForCausalLM.from_pretrained(
-            model_id, device_map="auto", trust_remote_code=True, torch_dtype=torch.bfloat16,
+            model_id, device_map="auto", trust_remote_code=True, quantization_config=bnb_config,
         ).eval()
 
     def query(self, image_path: Path, prompt: str) -> str:
