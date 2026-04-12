@@ -39,7 +39,12 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from pydantic import TypeAdapter, ValidationError
 from tqdm import tqdm
+
+# Validates that a JSON object is exactly dict[str, bool] (pydantic coerces
+# bare "true"/"false" strings to bool automatically)
+_BOOL_DICT = TypeAdapter(dict[str, bool])
 
 from dataset import MultiviewDataset
 
@@ -132,7 +137,12 @@ class LLaVAAdapter(ModelAdapter):
         import torch
         from transformers import LlavaNextForConditionalGeneration, LlavaNextProcessor
         from transformers import BitsAndBytesConfig
-        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
         self._processor = LlavaNextProcessor.from_pretrained(model_id)
         self._model_obj = LlavaNextForConditionalGeneration.from_pretrained(
             model_id, quantization_config=bnb_config, device_map="auto",
@@ -145,7 +155,7 @@ class LLaVAAdapter(ModelAdapter):
         text = self._processor.apply_chat_template(conv, add_generation_prompt=True)
         inputs = self._processor(img, text, return_tensors="pt").to(self._model_obj.device)
         with torch.no_grad():
-            out = self._model_obj.generate(**inputs, max_new_tokens=512)
+            out = self._model_obj.generate(**inputs, max_new_tokens=256)
         decoded = self._processor.decode(out[0], skip_special_tokens=True)
         # Strip the prompt portion that precedes the model's reply
         marker = "[/INST]"
@@ -164,7 +174,12 @@ class QwenAdapter(ModelAdapter):
         from transformers import AutoModelForCausalLM, AutoTokenizer
         self._tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
         from transformers import BitsAndBytesConfig
-        bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
         self._model_obj = AutoModelForCausalLM.from_pretrained(
             model_id, device_map="auto", trust_remote_code=True, quantization_config=bnb_config,
         ).eval()
@@ -205,7 +220,7 @@ def make_adapter(model_name: str, api_key: str | None, model_id: str | None) -> 
 # Prompt construction
 # ---------------------------------------------------------------------------
 
-def build_prompt(group: dict, axes: list[int]) -> str:
+def build_prompt(group: dict, axes: list[int], attempt: int = 0) -> str:
     a_color   = group["object_A"]["color"]
     b_color   = group["object_B"]["color"]
     a_label   = group["object_A"]["label"]
@@ -218,12 +233,21 @@ def build_prompt(group: dict, axes: list[int]) -> str:
         kv_lines.append(f'  "{a_color}_{AXIS_PROMPT_NEG[ax]}_{b_color}": <true or false>')
     json_template = "{\n" + ",\n".join(kv_lines) + "\n}"
 
+    retry_prefix = (
+        "IMPORTANT: Your previous response could not be parsed. "
+        "You MUST output ONLY the raw JSON object below — "
+        "no explanation, no markdown fences, no preamble, no trailing text.\n\n"
+    ) if attempt > 0 else ""
+
     return (
-        f"Imagine you are standing at the position of the {arr_color} arrow in this image, "
-        f"looking in the direction it is pointing.\n\n"
-        f"From this imagined perspective, define the spatial relations of the "
-        f"{a_color} object (the {a_label}) relative to the {b_color} object (the {b_label}).\n\n"
-        f"Respond with ONLY the following JSON object, replacing each placeholder with true or false:\n\n"
+        f"{retry_prefix}"
+        f"You are standing at the {arr_color} arrow in this image, "
+        f"looking in the direction it points.\n\n"
+        f"From that perspective, judge the spatial relations of the "
+        f"{a_color} object ({a_label}) relative to the {b_color} object ({b_label}).\n\n"
+        f"Output ONLY the JSON object below. "
+        f"Replace every <true or false> with true or false (lowercase, no quotes). "
+        f"Do not write anything before or after the JSON object.\n\n"
         f"{json_template}"
     )
 
@@ -257,23 +281,21 @@ def parse_response(
         return None, f"no JSON object found in response: {raw[:200]!r}"
 
     try:
-        data = json.loads(m.group())
+        data = _BOOL_DICT.validate_python(json.loads(m.group()))
     except json.JSONDecodeError as exc:
         return None, f"JSON decode error: {exc}"
+    except ValidationError as exc:
+        return None, f"schema validation error: {exc}"
 
-    result: dict[str, bool] = {}
-    for pk, ck in pk_to_ck.items():
-        if pk not in data:
-            return None, f"missing key {pk!r} in JSON"
-        val = data[pk]
-        if isinstance(val, bool):
-            result[ck] = val
-        elif isinstance(val, str) and val.lower() in ("true", "false"):
-            result[ck] = val.lower() == "true"
-        else:
-            return None, f"unexpected value for {pk!r}: {val!r}"
+    expected = set(pk_to_ck)
+    missing  = expected - data.keys()
+    extra    = data.keys() - expected
+    if missing:
+        return None, f"missing keys: {sorted(missing)}"
+    if extra:
+        return None, f"unexpected keys: {sorted(extra)}"
 
-    return result, None
+    return {ck: data[pk] for pk, ck in pk_to_ck.items()}, None
 
 
 # ---------------------------------------------------------------------------
@@ -643,19 +665,28 @@ def main() -> None:
     records: list[dict] = []
     pred_path  = out_dir / "predictions.jsonl"
 
+    MAX_RETRIES = 3
+
     with open(pred_path, "w", encoding="utf-8") as pred_f:
         for ex in tqdm(examples, desc="Querying"):
-            group      = group_by_id[ex["group_id"]]
-            image_path = repo_root / ex["image_path"]
-            prompt     = build_prompt(group, axes)
+            group        = group_by_id[ex["group_id"]]
+            image_path   = repo_root / ex["image_path"]
             ground_truth = group["reference_object_arrow"]["spatial_relations_from_arrow"]
 
-            try:
-                raw_response = adapter.query(image_path, prompt)
-            except Exception as exc:
-                raw_response = f"[API_ERROR] {exc}"
+            raw_response = ""
+            predicted    = None
+            parse_error  = None
 
-            predicted, parse_error = parse_response(raw_response, group, axes)
+            for attempt in range(MAX_RETRIES):
+                prompt = build_prompt(group, axes, attempt=attempt)
+                try:
+                    raw_response = adapter.query(image_path, prompt)
+                except Exception as exc:
+                    raw_response = f"[API_ERROR] {exc}"
+                    break
+                predicted, parse_error = parse_response(raw_response, group, axes)
+                if predicted is not None:
+                    break
             is_invalid  = predicted is not None and is_structurally_invalid(predicted, axes)
             diff_bin    = get_difficulty_bin(ex["yaw_to_arrow"])
 
