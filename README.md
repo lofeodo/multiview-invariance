@@ -12,15 +12,39 @@ Each object pair is rendered from two different camera positions. Because both v
 
 ## Quick start
 
-```bash
-# Install dependencies
-pip install open3d numpy Pillow pyvista huggingface_hub tqdm
+### Install dependencies
 
-# Run the benchmark (API models)
+**Dataset generation** (`generate_viewpoint_pairs.py`, `download_scenes.py`):
+```bash
+pip install open3d numpy Pillow pyvista huggingface_hub
+```
+
+**Benchmark — API models** (`chatgpt`, `gemini`):
+```bash
+pip install numpy Pillow tqdm openai google-generativeai
+```
+
+**Benchmark — local models** (`llava`, `qwen`):
+
+Install PyTorch first. For NVIDIA GPUs (recommended via conda):
+```bash
+conda install pytorch torchvision pytorch-cuda=12.4 -c pytorch -c nvidia
+```
+Then install the remaining packages:
+```bash
+pip install numpy Pillow tqdm transformers accelerate bitsandbytes
+```
+
+> `bitsandbytes` enables 8-bit quantization, which is required to run LLaVA or Qwen within typical GPU VRAM budgets. On Windows, use `pip install bitsandbytes --upgrade` to ensure you have v0.43+ (earlier versions had no Windows support).
+
+### Run the benchmark
+
+```bash
+# API models
 python benchmark.py --model chatgpt --api_key sk-...
 python benchmark.py --model gemini  --api_key AI...
 
-# Run the benchmark (local models, no API key needed)
+# Local models (no API key needed)
 python benchmark.py --model llava
 python benchmark.py --model qwen
 
