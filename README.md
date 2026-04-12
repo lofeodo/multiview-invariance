@@ -198,7 +198,24 @@ Key arguments:
 | `--first_variant_only` | off | Only process `sceneXXXX_00`, skip `_01`, `_02`, etc. |
 | `--no-reference-object` | — | Disable the colored arrow (arrow is placed by default) |
 | `--no-print-reference-image` | — | Disable rendering the arrow-viewpoint image (rendered by default) |
+| `--full-colour` | off | Render in original scene colours without highlighting or grayscale |
+| `--resolution_w` | `1024` | Output image width in pixels |
+| `--resolution_h` | `768` | Output image height in pixels |
+| `--fov` | `60.0` | Camera field of view in degrees |
+| `--camera_height` | `1.5` | Camera height above floor in metres |
 | `--max_pairs_per_scene` | `6` | Cap on pairs saved per scene |
+| `--min_object_volume` | `0.2` | Minimum object volume in m³ |
+| `--min_centroid_distance` | `0.5` | Minimum distance between object centroids in metres |
+| `--max_centroid_distance` | `5.0` | Maximum distance between object centroids in metres |
+| `--standoff_distance_factor` | `1.5` | Viewpoint standoff as a multiple of centroid distance |
+| `--standoff_min` | `1.0` | Minimum standoff distance in metres |
+| `--standoff_max` | `4.0` | Maximum standoff distance in metres |
+| `--min_projected_size` | `50` | Minimum object 2D bounding-box side length in pixels |
+| `--occlusion_ray_threshold` | `0.5` | Fraction of rays that must reach an object (occlusion check) |
+| `--max-arrow-occlusion` | `0.8` | Fraction of rays that must reach the arrow unblocked |
+| `--near_geom_dist` | `0.3` | Camera collision threshold in metres |
+| `--skip_labels` | — | Space-separated object labels to exclude |
+| `--verbose_output` | off | Include all technical fields in metadata JSON |
 | `--seed` | `42` | Random seed |
 
 > **Windows note:** Open3D's `OffscreenRenderer` requires EGL (Linux only). This repo uses PyVista instead, which works headlessly on Windows via VTK software rendering.
