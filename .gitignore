@@ -3,3 +3,4 @@ outputs/*
 dataset/*
 *.pyc
 outputs.bak/*
+results/*
