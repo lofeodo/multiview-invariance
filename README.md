@@ -22,7 +22,7 @@ python generate_viewpoint_pairs.py --reference-object --print-reference-image --
 ### Requirements
 
 ```
-pip install open3d numpy Pillow pyvista huggingface_hub
+pip install open3d numpy Pillow pyvista huggingface_hub openai
 ```
 
 | Package | Purpose |
@@ -32,8 +32,48 @@ pip install open3d numpy Pillow pyvista huggingface_hub
 | `Pillow` | Saving rendered images |
 | `pyvista` | Headless rendering (Windows-compatible via VTK) |
 | `huggingface_hub` | Downloading ScanNet scenes |
+| `openai` | Sending multimodal prompts (text + images) to ChatGPT/OpenAI models |
 
 > **Windows note:** Open3D's built-in `OffscreenRenderer` requires EGL (Linux only). This repo uses PyVista instead, which works headlessly on Windows via VTK software rendering.
+
+---
+
+## ChatGPT / OpenAI API
+
+The repo now includes a small multimodal client in `chatgpt_api.py`. It sends
+a text prompt plus one or more images to the OpenAI Responses API and returns
+the model's text reply.
+
+Set your API key first:
+
+```powershell
+$env:OPENAI_API_KEY="your_api_key_here"
+```
+
+Example:
+
+```bash
+python chatgpt_api.py \
+  --prompt "Describe the spatial relation between the highlighted objects in these views." \
+  --images outputs/scene0000_00/images/objA_3_objB_7_view_0.png \
+           outputs/scene0000_00/images/objA_3_objB_7_view_1.png
+```
+
+You can also import it from Python:
+
+```python
+from chatgpt_api import ChatGPTVisionClient
+
+client = ChatGPTVisionClient(model="gpt-4.1-mini")
+result = client.prompt_with_images(
+    prompt="What changed between these two viewpoints?",
+    image_sources=[
+        "outputs/scene0000_00/images/objA_3_objB_7_view_0.png",
+        "outputs/scene0000_00/images/objA_3_objB_7_view_1.png",
+    ],
+)
+print(result.text)
+```
 
 ---
 
