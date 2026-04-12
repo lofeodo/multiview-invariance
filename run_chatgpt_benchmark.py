@@ -35,9 +35,6 @@ INVALID_LABEL = "__invalid__"
 # Current OpenAI model-page pricing, used only for approximate cost reporting.
 MODEL_PRICING_USD_PER_1M: dict[str, dict[str, float]] = {
     "gpt-5.4": {"input": 3.0, "cached_input": 0.3, "output": 12.0},
-    "gpt-5.4-pro": {"input": 30.0, "cached_input": 3.0, "output": 180.0},
-    "gpt-5.4-mini": {"input": 0.75, "cached_input": 0.075, "output": 6.0},
-    "gpt-5.4-nano": {"input": 0.2, "cached_input": 0.02, "output": 1.6},
 }
 
 
@@ -47,6 +44,25 @@ class BenchmarkAPIError(RuntimeError):
     def __init__(self, message: str, *, status_code: int | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+def load_dotenv(dotenv_path: Path) -> None:
+    """Load simple KEY=VALUE pairs from a local .env file."""
+    if not dotenv_path.exists():
+        return
+
+    for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1372,6 +1388,7 @@ def make_run_config(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def main() -> None:
+    load_dotenv(Path(".env"))
     args = parse_args()
     outputs_dir = Path(args.outputs_dir)
     output_dir = Path(args.output_dir)
