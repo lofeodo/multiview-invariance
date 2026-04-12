@@ -75,6 +75,18 @@ result = client.prompt_with_images(
 print(result.text)
 ```
 
+For dataset-driven evaluation, use `run_chatgpt_benchmark.py`. It loads
+groups from `dataset/`, sends each group's viewpoint images to the API, and
+writes one JSONL result per group.
+
+```bash
+python run_chatgpt_benchmark.py \
+  --index-dir dataset \
+  --system-prompt-file prompts/system.txt \
+  --question "For each image, is object A left of object B?" \
+  --output results/chatgpt_results.jsonl
+```
+
 ---
 
 ## Data

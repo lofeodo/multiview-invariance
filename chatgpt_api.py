@@ -77,6 +77,7 @@ class ChatGPTVisionClient:
         self,
         prompt: str,
         image_sources: list[str | Path],
+        instructions: str | None = None,
         detail: str = "auto",
         max_output_tokens: int | None = None,
     ) -> ChatGPTResponse:
@@ -89,6 +90,9 @@ class ChatGPTVisionClient:
         image_sources:
             Paths or URLs for images. Local images are base64-encoded into
             data URLs so they can be sent directly in the API request.
+        instructions:
+            Optional higher-priority instructions to insert into the model
+            context, typically loaded from a separate system-prompt file.
         detail:
             Vision detail level: "auto", "low", or "high".
         max_output_tokens:
@@ -116,6 +120,8 @@ class ChatGPTVisionClient:
                 }
             ],
         }
+        if instructions is not None and instructions.strip():
+            request["instructions"] = instructions.strip()
         if max_output_tokens is not None:
             request["max_output_tokens"] = max_output_tokens
 
@@ -175,6 +181,11 @@ def _parse_args() -> argparse.Namespace:
         help="One or more local image paths or remote image URLs.",
     )
     parser.add_argument(
+        "--instructions-file",
+        default=None,
+        help="Optional path to a text file containing higher-priority instructions.",
+    )
+    parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
         help=f"OpenAI model name. Default: {DEFAULT_MODEL}",
@@ -213,9 +224,13 @@ def main() -> None:
         )
 
     client = ChatGPTVisionClient(model=args.model, api_key=api_key)
+    instructions = None
+    if args.instructions_file is not None:
+        instructions = Path(args.instructions_file).read_text(encoding="utf-8").strip()
     result = client.prompt_with_images(
         prompt=args.prompt,
         image_sources=args.images,
+        instructions=instructions,
         detail=args.detail,
         max_output_tokens=args.max_output_tokens,
     )
