@@ -1,8 +1,12 @@
 # multiview-invariance
 
-A benchmark for evaluating **VLM cross-viewpoint spatial reasoning invariance** using ScanNet 3D scenes.
+A benchmark for evaluating **spatial reasoning** and **cross-viewpoint invariance** in vision-language models (VLMs), using reconstructed 3D scenes from ScanNet.
 
-Each benchmark query shows a model a rendered scene image containing two color-highlighted objects and a colored arrow overlaid in the frame. The model must imagine standing at the arrow's position and predict the spatial relations between the two objects from that perspective. Because each object pair is rendered from multiple camera angles — with a fixed arrow as ground-truth anchor — we can measure not only prediction accuracy but also cross-viewpoint consistency.
+The core capability being tested is *mental viewpoint shifting*: can a model look at a scene from one camera angle, imagine standing somewhere else inside that scene, and correctly reason about how the spatial relations between objects change from that imagined perspective?
+
+Each benchmark query renders a 3D scene from a fixed camera position. Two objects in the scene are color-highlighted, and a colored arrow is overlaid — placed at a physically valid position in the scene and pointing toward the midpoint between the two objects. The model must imagine standing at the arrow's position, looking in its direction, and predict the spatial relations between the two objects from that perspective (e.g. "is A to the left or right of B?", "is A in front of or behind B?"). Ground truth is computed analytically from the arrow's camera pose.
+
+Each object pair is rendered from two different camera positions. Because both viewpoints share the same arrow and therefore the same ground truth, we can measure two things independently: (1) whether the model's predictions are **accurate**, and (2) whether they are **consistent across viewpoints** — i.e. whether the model gives the same answer regardless of which camera angle it sees the scene from. A model that reasons correctly about 3D space should be invariant to the camera angle of the rendered image.
 
 ---
 
@@ -151,13 +155,11 @@ Scene data is downloaded from `zahidpichen/scannet-dataset` on Hugging Face and 
 ```bash
 # Single scene
 python generate_viewpoint_pairs.py \
-    --scene_dir scannet_data/scene0000_00 \
-    --reference-object --print-reference-image
+    --scene_dir scannet_data/scene0000_00
 
 # Batch (all scenes, skip already-processed)
 python generate_viewpoint_pairs.py \
     --scene_dir scannet_data --batch \
-    --reference-object --print-reference-image \
     --skip_existing --first_variant_only
 ```
 
@@ -170,8 +172,8 @@ Key arguments:
 | `--batch` | off | Process all `scene*` subdirs |
 | `--skip_existing` | off | Skip scenes whose output dir already exists |
 | `--first_variant_only` | off | Only process `sceneXXXX_00`, skip `_01`, `_02`, etc. |
-| `--reference-object` | off | Place a colored arrow in each scene |
-| `--print-reference-image` | off | Also render an image from the arrow's viewpoint |
+| `--no-reference-object` | — | Disable the colored arrow (arrow is placed by default) |
+| `--no-print-reference-image` | — | Disable rendering the arrow-viewpoint image (rendered by default) |
 | `--max_pairs_per_scene` | `6` | Cap on pairs saved per scene |
 | `--seed` | `42` | Random seed |
 
