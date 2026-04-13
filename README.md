@@ -47,9 +47,9 @@ pip install open3d numpy Pillow pyvista huggingface_hub openai
 
 ## ChatGPT / OpenAI API
 
-The repo now includes a small multimodal client in `chatgpt_api.py`. It sends
-a text prompt plus one or more images to the OpenAI Responses API and returns
-the model's text reply.
+The repo includes a small standalone multimodal client in `chatgpt_api.py` for
+ad-hoc use. It sends a text prompt plus one or more images to the OpenAI
+Responses API and returns the model's text reply.
 
 Set your API key first:
 
@@ -66,33 +66,10 @@ python chatgpt_api.py \
            outputs/scene0000_00/images/objA_3_objB_7_view_1.png
 ```
 
-You can also import it from Python:
-
-```python
-from chatgpt_api import ChatGPTVisionClient
-
-client = ChatGPTVisionClient(model="gpt-4.1-mini")
-result = client.prompt_with_images(
-    prompt="What changed between these two viewpoints?",
-    image_sources=[
-        "outputs/scene0000_00/images/objA_3_objB_7_view_0.png",
-        "outputs/scene0000_00/images/objA_3_objB_7_view_1.png",
-    ],
-)
-print(result.text)
-```
-
-For dataset-driven evaluation, use `run_chatgpt_benchmark.py`. It loads
-groups from `dataset/`, sends each group's viewpoint images to the API, and
-writes one JSONL result per group.
-
-```bash
-python run_chatgpt_benchmark.py \
-  --index-dir dataset \
-  --system-prompt-file prompts/system.txt \
-  --question "For each image, is object A left of object B?" \
-  --output results/chatgpt_results.jsonl
-```
+For dataset-driven evaluation, use `benchmark.py --model chatgpt`. This uses
+the OpenAI Responses API with server-side structured output enforcement
+(`json_schema` for enum format) and records per-query latency and cost
+estimates in `metrics.json`.
 
 ---
 
@@ -146,11 +123,14 @@ python benchmark.py --model gemini  --api_key AI...
 python benchmark.py --model llava
 python benchmark.py --model qwen
 
-# Use enum prompt format (recommended for Qwen to reduce yes-bias)
-python benchmark.py --model qwen --prompt_format enum
+# Use boolean prompt format (enum is the default; boolean uses true/false fields)
+python benchmark.py --model qwen --prompt_format boolean
 
 # Restrict to specific spatial axes or a smaller sample
 python benchmark.py --model chatgpt --api_key sk-... --axes 0 1 --n_viewpoints 100
+
+# ChatGPT with reasoning and custom image detail
+python benchmark.py --model chatgpt --api_key sk-... --reasoning_effort medium --detail high
 ```
 
 ---
@@ -177,7 +157,10 @@ Override the version with `--model_id`, e.g. `--model_id gpt-4o-mini`.
 | `--model_id` | auto | Override the default model version |
 | `--n_viewpoints` | `500` | Total queries. Must be even; rounded down automatically if odd |
 | `--axes` | `0 1 2` | Axes to evaluate: `0` = lateral (left/right), `1` = depth (front/behind), `2` = vertical (above/below) |
-| `--prompt_format` | `boolean` | `boolean`: 6 true/false fields per query; `enum`: 3 fields with exclusive string choices (`left`/`right`/`neither` etc.) — reduces yes-bias in models like Qwen |
+| `--prompt_format` | `enum` | `enum` (default): one exclusive string choice per axis (`left`/`right`/`neither` etc.); `boolean`: true/false for each direction. For `chatgpt`, enum enables strict server-side `json_schema` enforcement. |
+| `--reasoning_effort` | `none` | ChatGPT only. Reasoning effort for o-series / reasoning-capable models: `none`, `low`, `medium`, `high`, `xhigh`. |
+| `--max_output_tokens` | — | ChatGPT only. Cap on generated output tokens. |
+| `--detail` | `auto` | ChatGPT only. Image detail level: `auto`, `low`, `high`, `original`. |
 | `--dataset_dir` | `dataset` | Dataset index directory |
 | `--output_dir` | `results` | Root directory for outputs |
 | `--seed` | `42` | Random seed for group shuffling |
@@ -195,8 +178,8 @@ Results are written to `results/<model>_<timestamp>/`:
 | File | Contents |
 |---|---|
 | `config.json` | Run configuration |
-| `predictions.jsonl` | Per-query: example id, ground truth, prediction, parse error, difficulty bin |
-| `metrics.json` | All computed metrics |
+| `predictions.jsonl` | Per-query: example id, ground truth, prediction, parse error, difficulty bin, latency, usage, cost |
+| `metrics.json` | All computed metrics, plus `run_stats` (latency and cost aggregates for chatgpt) |
 
 Predictions stream to disk as they arrive, so a partial run is not lost if interrupted.
 
@@ -224,6 +207,11 @@ Predictions stream to disk as they arrive, so a partial run is not lost if inter
 **Diagnostic**
 - `confusion_matrices` — per axis; rows = ground truth `{positive, negative, neither}`, columns = predicted `{positive, negative, neither, invalid}`
 - `directional_bias` — per-direction true-rate in dataset ground truth vs. model predictions
+
+**Run stats** (`run_stats` key; ChatGPT only for cost fields)
+- `total_latency_seconds`, `avg_latency_seconds` — wall-clock query time
+- `total_estimated_cost_usd` — approximate cost based on published token pricing
+- `total_input_tokens`, `total_output_tokens`, `total_cached_input_tokens` — token counts
 
 **Difficulty bins** — all of the above repeated within five bins defined by `|yaw_to_arrow|` (camera-to-arrow misalignment):
 
