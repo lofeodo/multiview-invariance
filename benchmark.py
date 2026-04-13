@@ -247,6 +247,8 @@ def build_prompt(group: dict, axes: list[int], attempt: int = 0) -> str:
         f"looking in the direction it points.\n\n"
         f"From that perspective, judge the spatial relations of the "
         f"{a_color} object ({a_label}) relative to the {b_color} object ({b_label}).\n\n"
+        f"Rules: for each opposite pair (left/right, in_front/behind, above/below), "
+        f"at most one can be true — they cannot both be true at the same time.\n\n"
         f"Output ONLY the JSON object below. "
         f"Replace every <true or false> with true or false (lowercase, no quotes). "
         f"Do not write anything before or after the JSON object.\n\n"
