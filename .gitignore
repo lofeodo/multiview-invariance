@@ -4,3 +4,4 @@ dataset/*
 *.pyc
 outputs.bak/*
 results/*
+*.ttf
