@@ -9,7 +9,7 @@ relations stored in the dataset index.
 
 Supported models:
     chatgpt  — OpenAI Responses API (gpt-4o by default)
-    gemini   — Google Generative AI API (gemini-1.5-flash by default)
+    gemini   — Google Generative AI REST API (gemini-2.5-pro by default)
     llava    — LLaVA loaded locally via transformers
     qwen     — Qwen-VL-Chat loaded locally via transformers
 
@@ -36,6 +36,8 @@ import mimetypes
 import re
 import sys
 import time
+import urllib.error
+import urllib.request
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -103,7 +105,9 @@ MODEL_PRICING_USD_PER_1M: dict[str, dict[str, float]] = {
     "gpt-4.1":      {"input": 2.0,  "cached_input": 0.5,   "output": 8.0},
     "gpt-4.1-mini": {"input": 0.4,  "cached_input": 0.1,   "output": 1.6},
     "gpt-4.1-nano": {"input": 0.1,  "cached_input": 0.025, "output": 0.4},
-    "gpt-5.4":      {"input": 3.0,  "cached_input": 0.3,   "output": 12.0},
+    "gpt-5.4":         {"input": 3.0,  "cached_input": 0.3,    "output": 12.0},
+    "gemini-2.5-pro":  {"input": 1.25, "cached_input": 0.125,  "output": 10.0},
+    "gemini-2.5-flash": {"input": 0.15, "cached_input": 0.0375, "output": 0.60},
 }
 
 VALID_IMAGE_DETAILS = {"auto", "low", "high", "original"}
@@ -249,6 +253,12 @@ def _compute_run_stats(records: list[dict]) -> dict[str, Any]:
 # Model adapters
 # ---------------------------------------------------------------------------
 
+class _GeminiAPIError(RuntimeError):
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class ModelAdapter:
     def query(self, image_path: Path, prompt: str) -> QueryResult:
         raise NotImplementedError
@@ -326,18 +336,170 @@ class ChatGPTAdapter(ModelAdapter):
 
 
 class GeminiAdapter(ModelAdapter):
-    def __init__(self, api_key: str, model_id: str = "gemini-1.5-flash") -> None:
-        try:
-            import google.generativeai as genai
-        except ImportError:
-            sys.exit("google-generativeai package not installed. Run: pip install google-generativeai")
-        genai.configure(api_key=api_key)
-        self._model = genai.GenerativeModel(model_id)
+    """Calls the Gemini REST API directly (no SDK required).
 
-    def query(self, image_path: Path, prompt: str) -> QueryResult:
+    Interface mirrors ChatGPTAdapter: query() accepts an optional json_format
+    dict built by _build_json_format(), enabling JSON-schema or JSON-object
+    enforcement at generation time.
+    """
+
+    _RETRY_STATUSES: frozenset[int] = frozenset({408, 429, 500, 502, 503, 504})
+    _API_URL = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "{model}:generateContent"
+    )
+
+    def __init__(
+        self,
+        api_key: str,
+        model_id: str = "gemini-2.5-pro",
+        *,
+        thinking_budget: int = 0,
+        max_output_tokens: int | None = None,
+        detail: str = "auto",
+        timeout_seconds: float = 180.0,
+        max_retries: int = 3,
+        retry_backoff_seconds: float = 2.0,
+    ) -> None:
+        self._api_key             = api_key
+        self._model_id            = model_id
+        self._thinking_budget     = thinking_budget
+        self._max_output_tokens   = max_output_tokens
+        self._detail              = detail
+        self._timeout             = timeout_seconds
+        self._max_retries         = max_retries
+        self._retry_backoff       = retry_backoff_seconds
+
+    def _build_payload(
+        self,
+        image_path: Path,
+        prompt: str,
+        *,
+        json_format: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        mime_type, _ = mimetypes.guess_type(image_path.name)
+        if mime_type is None:
+            mime_type = "image/png"
+        encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+
+        generation_config: dict[str, Any] = {"responseMimeType": "application/json"}
+        if self._max_output_tokens is not None:
+            generation_config["maxOutputTokens"] = self._max_output_tokens
+        if self._thinking_budget > 0:
+            generation_config["thinkingConfig"] = {"thinkingBudget": self._thinking_budget}
+        if json_format is not None and json_format.get("type") == "json_schema":
+            generation_config["responseJsonSchema"] = json_format.get("schema", {})
+
+        return {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": prompt},
+                        {"inline_data": {"mime_type": mime_type, "data": encoded}},
+                    ],
+                }
+            ],
+            "generationConfig": generation_config,
+        }
+
+    def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
+        url = self._API_URL.format(model=self._model_id)
+        req = urllib.request.Request(
+            url=url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "x-goog-api-key": self._api_key,
+                "Content-Type":   "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise _GeminiAPIError(f"HTTP {exc.code}: {body}", status_code=exc.code) from exc
+        except urllib.error.URLError as exc:
+            raise _GeminiAPIError(str(exc), status_code=None) from exc
+
+    def _post_with_retries(self, payload: dict[str, Any]) -> dict[str, Any]:
+        for attempt in range(self._max_retries + 1):
+            try:
+                return self._post(payload)
+            except _GeminiAPIError as exc:
+                if attempt >= self._max_retries or exc.status_code not in self._RETRY_STATUSES:
+                    raise
+                wait = self._retry_backoff * (2 ** attempt)
+                print(f"  [gemini] transient error ({exc}); retrying in {wait:.1f}s…")
+                time.sleep(wait)
+        raise AssertionError("unreachable")
+
+    @staticmethod
+    def _extract_text(response_json: dict[str, Any]) -> str:
+        texts: list[str] = []
+        for candidate in response_json.get("candidates", []):
+            for part in (candidate.get("content") or {}).get("parts", []):
+                if isinstance(part.get("text"), str):
+                    texts.append(part["text"])
+        if texts:
+            return "\n".join(texts).strip()
+        block = (response_json.get("promptFeedback") or {}).get("blockReason")
+        if block:
+            return f"[BLOCKED] {block}"
+        for candidate in response_json.get("candidates", []):
+            fr = candidate.get("finishReason")
+            if fr:
+                texts.append(f"[NO_TEXT] finishReason={fr}")
+        return "\n".join(texts).strip()
+
+    @staticmethod
+    def _normalize_usage(raw: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Map Gemini usageMetadata field names to the canonical format used by _usage_counts()."""
+        if raw is None:
+            return None
+        return {
+            "input_tokens":        raw.get("promptTokenCount"),
+            "output_tokens":       raw.get("candidatesTokenCount"),
+            "total_tokens":        raw.get("totalTokenCount"),
+            "cached_input_tokens": raw.get("cachedContentTokenCount") or 0,
+        }
+
+    def query(
+        self,
+        image_path: Path,
+        prompt: str,
+        *,
+        json_format: dict[str, Any] | None = None,
+    ) -> QueryResult:
+        payload = self._build_payload(image_path, prompt, json_format=json_format)
+        request_format_label = (json_format or {}).get("type", "text")
+
         start = time.perf_counter()
-        resp  = self._model.generate_content([prompt, Image.open(image_path)])
-        return QueryResult(text=resp.text, latency_seconds=time.perf_counter() - start)
+        try:
+            response_json = self._post_with_retries(payload)
+        except _GeminiAPIError as exc:
+            if exc.status_code == 400 and json_format and json_format.get("type") == "json_schema":
+                fallback_payload     = self._build_payload(
+                    image_path, prompt, json_format={"type": "json_object"}
+                )
+                request_format_label = "json_object_fallback"
+                response_json        = self._post_with_retries(fallback_payload)
+            else:
+                raise
+        latency = time.perf_counter() - start
+
+        text      = self._extract_text(response_json)
+        usage_raw = self._normalize_usage(response_json.get("usageMetadata"))
+        model_used = response_json.get("modelVersion", self._model_id)
+
+        return QueryResult(
+            text               = text,
+            latency_seconds    = latency,
+            usage              = usage_raw,
+            estimated_cost_usd = _estimate_cost_usd(model_used, usage_raw),
+            request_format     = request_format_label,
+        )
 
 
 class LLaVAAdapter(ModelAdapter):
@@ -418,12 +580,13 @@ def make_adapter(
     model_id: str | None,
     *,
     reasoning_effort: str = "none",
+    thinking_budget: int = 0,
     max_output_tokens: int | None = None,
     detail: str = "auto",
 ) -> ModelAdapter:
     defaults = {
         "chatgpt": "gpt-4o",
-        "gemini":  "gemini-1.5-flash",
+        "gemini":  "gemini-2.5-pro",
         "llava":   "llava-hf/llava-v1.6-mistral-7b-hf",
         "qwen":    "Qwen/Qwen-VL-Chat",
     }
@@ -440,9 +603,16 @@ def make_adapter(
             detail            = detail,
         )
     if model_name == "gemini":
+        import os
+        api_key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         if not api_key:
-            sys.exit("--api_key is required for --model gemini")
-        return GeminiAdapter(api_key, mid)
+            sys.exit("--api_key is required for --model gemini (or set GEMINI_API_KEY)")
+        return GeminiAdapter(
+            api_key, mid,
+            thinking_budget   = thinking_budget,
+            max_output_tokens = max_output_tokens,
+            detail            = detail,
+        )
     if model_name == "llava":
         return LLaVAAdapter(mid)
     if model_name == "qwen":
@@ -895,7 +1065,7 @@ def main() -> None:
         help=(
             "Prompt format: 'enum' (default) asks one exclusive string choice per axis "
             "(left/right/neither etc.); 'boolean' asks true/false for each direction. "
-            "For chatgpt, enum enables strict server-side json_schema enforcement."
+            "For chatgpt and gemini, enum enables strict server-side json_schema enforcement."
         ),
     )
     parser.add_argument(
@@ -905,14 +1075,21 @@ def main() -> None:
         help="Reasoning effort for ChatGPT (OpenAI reasoning-capable models). Ignored for other models.",
     )
     parser.add_argument(
+        "--thinking_budget", type=int, default=0,
+        help=(
+            "Gemini thinking budget. 0 disables thinking on Gemini 2.5 Flash; "
+            "use a positive integer to enable extra thinking. Ignored for other models."
+        ),
+    )
+    parser.add_argument(
         "--max_output_tokens", type=int, default=None,
-        help="Maximum output tokens (ChatGPT only). Default: no explicit limit.",
+        help="Maximum output tokens (ChatGPT and Gemini). Default: no explicit limit.",
     )
     parser.add_argument(
         "--detail",
         choices=sorted(VALID_IMAGE_DETAILS),
         default="auto",
-        help="Image detail level sent to ChatGPT. Ignored for other models.",
+        help="Image detail level sent to ChatGPT. Recorded in config for Gemini runs.",
     )
     parser.add_argument(
         "--dataset_dir", default="dataset",
@@ -976,6 +1153,7 @@ def main() -> None:
         "axis_names":        [AXIS_NAMES[ax] for ax in axes],
         "prompt_format":     args.prompt_format,
         "reasoning_effort":  args.reasoning_effort,
+        "thinking_budget":   args.thinking_budget,
         "max_output_tokens": args.max_output_tokens,
         "detail":            args.detail,
         "dataset_dir":       args.dataset_dir,
@@ -988,12 +1166,17 @@ def main() -> None:
     adapter = make_adapter(
         args.model, args.api_key, args.model_id,
         reasoning_effort  = args.reasoning_effort,
+        thinking_budget   = args.thinking_budget,
         max_output_tokens = args.max_output_tokens,
         detail            = args.detail,
     )
 
-    # Pre-build the JSON format spec for ChatGPT (same for all queries)
-    json_format = _build_json_format(axes, args.prompt_format) if args.model == "chatgpt" else None
+    # Pre-build the JSON format spec for ChatGPT and Gemini (same for all queries)
+    json_format = (
+        _build_json_format(axes, args.prompt_format)
+        if args.model in ("chatgpt", "gemini")
+        else None
+    )
 
     # ── Run queries ───────────────────────────────────────────────────────
     repo_root  = Path(__file__).parent
@@ -1019,7 +1202,7 @@ def main() -> None:
             for attempt in range(MAX_RETRIES):
                 prompt = build_prompt(group, axes, attempt=attempt, fmt=args.prompt_format)
                 try:
-                    if args.model == "chatgpt":
+                    if args.model in ("chatgpt", "gemini"):
                         result = adapter.query(image_path, prompt, json_format=json_format)
                     else:
                         result = adapter.query(image_path, prompt)
