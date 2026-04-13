@@ -1,6 +1,8 @@
 scannet_data/*
 outputs/*
 dataset/*
+results/*
+.env
 *.pyc
 outputs.bak/*
 results/*

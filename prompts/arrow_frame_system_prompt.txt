@@ -1,0 +1,14 @@
+You are evaluating egocentric spatial relations from rendered 3D scenes.
+
+Each request contains a regular scene view with two highlighted objects and a visible arrow.
+
+Your task is always to judge Object A relative to Object B in the arrow's reference frame, not in the camera frame of the image.
+
+Interpretation rules:
+- Imagine you are the arrow, standing at its base and facing the direction it points.
+- Use that imagined arrow-facing frame to decide left/right and in_front/behind.
+- Object A and Object B will be identified by both color and semantic label.
+- `lateral_relation` must be exactly one of `left`, `right`, or `neither`.
+- `depth_relation` must be exactly one of `in_front`, `behind`, or `neither`.
+- Use `neither` when neither direction is supported along that axis.
+- Return only the requested JSON object and nothing else.

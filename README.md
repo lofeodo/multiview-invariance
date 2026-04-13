@@ -16,10 +16,108 @@ Each object pair is rendered from two different camera positions. Because both v
 
 **Dataset generation** (`generate_viewpoint_pairs.py`, `download_scenes.py`):
 ```bash
-pip install open3d numpy Pillow pyvista huggingface_hub
+python download_scenes.py --scenes 0
+python generate_viewpoint_pairs.py --reference-object --print-reference-image --scene_dir scannet_data/scene0000_00
+```
+
+---
+
+
+## Setup
+
+### Requirements
+
+```
+pip install open3d numpy Pillow pyvista huggingface_hub openai
 ```
 
 **Benchmark — API models** (`chatgpt`, `gemini`):
+| Package | Purpose |
+|---|---|
+| `open3d` | Mesh loading, raycasting (occlusion checks) |
+| `numpy` | All geometry math |
+| `Pillow` | Saving rendered images |
+| `pyvista` | Headless rendering (Windows-compatible via VTK) |
+| `huggingface_hub` | Downloading ScanNet scenes |
+| `openai` | Sending multimodal prompts (text + images) to ChatGPT/OpenAI models |
+
+> **Windows note:** Open3D's built-in `OffscreenRenderer` requires EGL (Linux only). This repo uses PyVista instead, which works headlessly on Windows via VTK software rendering.
+
+---
+
+## ChatGPT / OpenAI API
+
+The repo now includes a small multimodal client in `chatgpt_api.py`. It sends
+a text prompt plus one or more images to the OpenAI Responses API and returns
+the model's text reply.
+
+Set your API key first:
+
+```powershell
+$env:OPENAI_API_KEY="your_api_key_here"
+```
+
+Example:
+
+```bash
+python chatgpt_api.py \
+  --prompt "Describe the spatial relation between the highlighted objects in these views." \
+  --images outputs/scene0000_00/images/objA_3_objB_7_view_0.png \
+           outputs/scene0000_00/images/objA_3_objB_7_view_1.png
+```
+
+You can also import it from Python:
+
+```python
+from chatgpt_api import ChatGPTVisionClient
+
+client = ChatGPTVisionClient(model="gpt-4.1-mini")
+result = client.prompt_with_images(
+    prompt="What changed between these two viewpoints?",
+    image_sources=[
+        "outputs/scene0000_00/images/objA_3_objB_7_view_0.png",
+        "outputs/scene0000_00/images/objA_3_objB_7_view_1.png",
+    ],
+)
+print(result.text)
+```
+
+For dataset-driven evaluation, use `run_chatgpt_benchmark.py`. It loads
+groups from `dataset/`, sends each group's viewpoint images to the API, and
+writes one JSONL result per group.
+
+```bash
+python run_chatgpt_benchmark.py \
+  --index-dir dataset \
+  --system-prompt-file prompts/system.txt \
+  --question "For each image, is object A left of object B?" \
+  --output results/chatgpt_results.jsonl
+```
+
+---
+
+## Data
+
+Scene data is downloaded from the `zahidpichen/scannet-dataset` Hugging Face dataset and stored under `scannet_data/`.
+
+Each scene directory (e.g. `scannet_data/scene0000_00/`) contains:
+
+| File | Contents |
+|---|---|
+| `scene0000_00_vh_clean_2.ply` | Reconstructed mesh with per-vertex RGB colors |
+| `scene0000_00_vh_clean_2.labels.ply` | Same mesh with per-vertex semantic label IDs |
+| `scene0000_00_vh_clean_2.0.010000.segs.json` | Maps each vertex index → segment ID |
+| `scene0000_00.aggregation.json` | Maps object instances → segment lists + labels |
+| `scene0000_00.txt` | Scene metadata including axis alignment matrix |
+
+---
+
+## Scripts
+
+### 1. `download_scenes.py` — Download ScanNet scenes
+
+Download specific scenes by ID, a contiguous range, or all scenes. `--scenes`, `--upto`, and `--from` are mutually exclusive.
+
 ```bash
 pip install numpy Pillow tqdm openai google-generativeai
 ```
