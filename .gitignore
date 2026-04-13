@@ -5,3 +5,4 @@ results/*
 .env
 *.pyc
 outputs.bak/*
+*.ttf
