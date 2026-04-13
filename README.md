@@ -35,7 +35,7 @@ Then install the remaining packages:
 pip install numpy Pillow tqdm "transformers==4.40.2" accelerate bitsandbytes tiktoken einops transformers_stream_generator
 ```
 
-> `bitsandbytes` enables 8-bit quantization, which is required to run LLaVA or Qwen within typical GPU VRAM budgets. On Windows, use `pip install bitsandbytes --upgrade` to ensure you have v0.43+ (earlier versions had no Windows support).
+> `bitsandbytes` enables 4-bit quantization, which is required to run LLaVA or Qwen within typical GPU VRAM budgets. On Windows, use `pip install bitsandbytes --upgrade` to ensure you have v0.43+ (earlier versions had no Windows support).
 
 ### Run the benchmark
 
