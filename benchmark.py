@@ -66,6 +66,14 @@ AXIS_KEYS: dict[int, tuple[str, str]] = {
 AXIS_PROMPT_POS: dict[int, str] = {0: "left_of",     1: "in_front_of", 2: "above"}
 AXIS_PROMPT_NEG: dict[int, str] = {0: "right_of",    1: "behind",      2: "below"}
 
+# Enum-format: axis key suffix and allowed values → (pos_canonical, neg_canonical)
+AXIS_ENUM_KEY:    dict[int, str]                    = {0: "lateral",  1: "depth",   2: "vertical"}
+AXIS_ENUM_VALUES: dict[int, tuple[str, str, str]]   = {
+    0: ("left",     "right",   "neither"),
+    1: ("in_front", "behind",  "neither"),
+    2: ("above",    "below",   "neither"),
+}
+
 DIFFICULTY_BINS: list[tuple[str, float, float]] = [
     ("aligned",   0,    30),
     ("slight",   30,    60),
@@ -222,18 +230,12 @@ def make_adapter(model_name: str, api_key: str | None, model_id: str | None) -> 
 # Prompt construction
 # ---------------------------------------------------------------------------
 
-def build_prompt(group: dict, axes: list[int], attempt: int = 0) -> str:
+def build_prompt(group: dict, axes: list[int], attempt: int = 0, fmt: str = "boolean") -> str:
     a_color   = group["object_A"]["color"]
     b_color   = group["object_B"]["color"]
     a_label   = group["object_A"]["label"]
     b_label   = group["object_B"]["label"]
     arr_color = group["reference_object_arrow"]["color"]
-
-    kv_lines: list[str] = []
-    for ax in axes:
-        kv_lines.append(f'  "{a_color}_{AXIS_PROMPT_POS[ax]}_{b_color}": <true or false>')
-        kv_lines.append(f'  "{a_color}_{AXIS_PROMPT_NEG[ax]}_{b_color}": <true or false>')
-    json_template = "{\n" + ",\n".join(kv_lines) + "\n}"
 
     retry_prefix = (
         "IMPORTANT: Your previous response could not be parsed. "
@@ -241,19 +243,44 @@ def build_prompt(group: dict, axes: list[int], attempt: int = 0) -> str:
         "no explanation, no markdown fences, no preamble, no trailing text.\n\n"
     ) if attempt > 0 else ""
 
-    return (
+    preamble = (
         f"{retry_prefix}"
         f"You are standing at the {arr_color} arrow in this image, "
         f"looking in the direction it points.\n\n"
         f"From that perspective, judge the spatial relations of the "
         f"{a_color} object ({a_label}) relative to the {b_color} object ({b_label}).\n\n"
-        f"Rules: for each opposite pair (left/right, in_front/behind, above/below), "
-        f"at most one can be true — they cannot both be true at the same time.\n\n"
-        f"Output ONLY the JSON object below. "
-        f"Replace every <true or false> with true or false (lowercase, no quotes). "
-        f"Do not write anything before or after the JSON object.\n\n"
-        f"{json_template}"
     )
+
+    if fmt == "enum":
+        kv_lines: list[str] = []
+        for ax in axes:
+            pos, neg, neither = AXIS_ENUM_VALUES[ax]
+            key = f"{a_color}_{AXIS_ENUM_KEY[ax]}_to_{b_color}"
+            kv_lines.append(f'  "{key}": "{pos}" or "{neg}" or "{neither}"')
+        json_template = "{\n" + ",\n".join(kv_lines) + "\n}"
+        return (
+            f"{preamble}"
+            f"For each axis, choose exactly one value from the options shown.\n\n"
+            f"Output ONLY the JSON object below. "
+            f"Replace each option list with your chosen value (a quoted string). "
+            f"Do not write anything before or after the JSON object.\n\n"
+            f"{json_template}"
+        )
+    else:
+        kv_lines = []
+        for ax in axes:
+            kv_lines.append(f'  "{a_color}_{AXIS_PROMPT_POS[ax]}_{b_color}": <true or false>')
+            kv_lines.append(f'  "{a_color}_{AXIS_PROMPT_NEG[ax]}_{b_color}": <true or false>')
+        json_template = "{\n" + ",\n".join(kv_lines) + "\n}"
+        return (
+            f"{preamble}"
+            f"Rules: for each opposite pair (left/right, in_front/behind, above/below), "
+            f"at most one can be true — they cannot both be true at the same time.\n\n"
+            f"Output ONLY the JSON object below. "
+            f"Replace every <true or false> with true or false (lowercase, no quotes). "
+            f"Do not write anything before or after the JSON object.\n\n"
+            f"{json_template}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +291,7 @@ def parse_response(
     raw: str,
     group: dict,
     axes: list[int],
+    fmt: str = "boolean",
 ) -> tuple[dict[str, bool] | None, str | None]:
     """Extract and validate the model's JSON from *raw*.
 
@@ -273,33 +301,56 @@ def parse_response(
     a_color = group["object_A"]["color"]
     b_color = group["object_B"]["color"]
 
-    # Map prompt keys → canonical keys
-    pk_to_ck: dict[str, str] = {}
-    for ax in axes:
-        pos_k, neg_k = AXIS_KEYS[ax]
-        pk_to_ck[f"{a_color}_{AXIS_PROMPT_POS[ax]}_{b_color}"] = pos_k
-        pk_to_ck[f"{a_color}_{AXIS_PROMPT_NEG[ax]}_{b_color}"] = neg_k
-
     m = re.search(r"\{[^{}]*\}", raw, re.DOTALL)
     if not m:
         return None, f"no JSON object found in response: {raw[:200]!r}"
 
     try:
-        data = _BOOL_DICT.validate_python(json.loads(m.group()))
+        data = json.loads(m.group())
     except json.JSONDecodeError as exc:
         return None, f"JSON decode error: {exc}"
-    except ValidationError as exc:
-        return None, f"schema validation error: {exc}"
 
-    expected = set(pk_to_ck)
-    missing  = expected - data.keys()
-    extra    = data.keys() - expected
-    if missing:
-        return None, f"missing keys: {sorted(missing)}"
-    if extra:
-        return None, f"unexpected keys: {sorted(extra)}"
+    if fmt == "enum":
+        result: dict[str, bool] = {}
+        for ax in axes:
+            key = f"{a_color}_{AXIS_ENUM_KEY[ax]}_to_{b_color}"
+            if key not in data:
+                return None, f"missing key: {key!r}"
+            val = data[key]
+            pos_v, neg_v, neither_v = AXIS_ENUM_VALUES[ax]
+            pos_k, neg_k = AXIS_KEYS[ax]
+            if val == pos_v:
+                result[pos_k] = True;  result[neg_k] = False
+            elif val == neg_v:
+                result[pos_k] = False; result[neg_k] = True
+            elif val == neither_v:
+                result[pos_k] = False; result[neg_k] = False
+            else:
+                allowed = f'"{pos_v}", "{neg_v}", "{neither_v}"'
+                return None, f"invalid value {val!r} for {key!r}; expected one of {allowed}"
+        return result, None
+    else:
+        # Map prompt keys → canonical keys
+        pk_to_ck: dict[str, str] = {}
+        for ax in axes:
+            pos_k, neg_k = AXIS_KEYS[ax]
+            pk_to_ck[f"{a_color}_{AXIS_PROMPT_POS[ax]}_{b_color}"] = pos_k
+            pk_to_ck[f"{a_color}_{AXIS_PROMPT_NEG[ax]}_{b_color}"] = neg_k
 
-    return {ck: data[pk] for pk, ck in pk_to_ck.items()}, None
+        try:
+            data = _BOOL_DICT.validate_python(data)
+        except ValidationError as exc:
+            return None, f"schema validation error: {exc}"
+
+        expected = set(pk_to_ck)
+        missing  = expected - data.keys()
+        extra    = data.keys() - expected
+        if missing:
+            return None, f"missing keys: {sorted(missing)}"
+        if extra:
+            return None, f"unexpected keys: {sorted(extra)}"
+
+        return {ck: data[pk] for pk, ck in pk_to_ck.items()}, None
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +647,13 @@ def main() -> None:
         help="Axes to evaluate: 0=lateral (left/right), 1=depth (front/behind), 2=vertical (above/below)",
     )
     parser.add_argument(
+        "--prompt_format", default="boolean", choices=["boolean", "enum"],
+        help=(
+            "Prompt format: 'boolean' asks 6 true/false fields per axis pair; "
+            "'enum' asks 3 fields each with an exclusive string choice (left/right/neither, etc.)"
+        ),
+    )
+    parser.add_argument(
         "--dataset_dir", default="dataset",
         help="Path to the dataset index directory produced by build_dataset_index.py",
     )
@@ -649,15 +707,16 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     (out_dir / "config.json").write_text(json.dumps({
-        "model":        args.model,
-        "model_id":     args.model_id,
-        "n_viewpoints": len(examples),
-        "n_groups":     n_groups_needed,
-        "axes":         axes,
-        "axis_names":   [AXIS_NAMES[ax] for ax in axes],
-        "dataset_dir":  args.dataset_dir,
-        "seed":         args.seed,
-        "timestamp":    ts,
+        "model":         args.model,
+        "model_id":      args.model_id,
+        "n_viewpoints":  len(examples),
+        "n_groups":      n_groups_needed,
+        "axes":          axes,
+        "axis_names":    [AXIS_NAMES[ax] for ax in axes],
+        "prompt_format": args.prompt_format,
+        "dataset_dir":   args.dataset_dir,
+        "seed":          args.seed,
+        "timestamp":     ts,
     }, indent=2))
 
     # ── Load model ────────────────────────────────────────────────────────
@@ -682,13 +741,13 @@ def main() -> None:
             parse_error  = None
 
             for attempt in range(MAX_RETRIES):
-                prompt = build_prompt(group, axes, attempt=attempt)
+                prompt = build_prompt(group, axes, attempt=attempt, fmt=args.prompt_format)
                 try:
                     raw_response = adapter.query(image_path, prompt)
                 except Exception as exc:
                     raw_response = f"[API_ERROR] {exc}"
                     break
-                predicted, parse_error = parse_response(raw_response, group, axes)
+                predicted, parse_error = parse_response(raw_response, group, axes, fmt=args.prompt_format)
                 if predicted is not None:
                     break
             is_invalid  = predicted is not None and is_structurally_invalid(predicted, axes)

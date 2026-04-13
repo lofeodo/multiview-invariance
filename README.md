@@ -48,6 +48,9 @@ python benchmark.py --model gemini  --api_key AI...
 python benchmark.py --model llava
 python benchmark.py --model qwen
 
+# Use enum prompt format (recommended for Qwen to reduce yes-bias)
+python benchmark.py --model qwen --prompt_format enum
+
 # Restrict to specific spatial axes or a smaller sample
 python benchmark.py --model chatgpt --api_key sk-... --axes 0 1 --n_viewpoints 100
 ```
@@ -76,6 +79,7 @@ Override the version with `--model_id`, e.g. `--model_id gpt-4o-mini`.
 | `--model_id` | auto | Override the default model version |
 | `--n_viewpoints` | `500` | Total queries. Must be even; rounded down automatically if odd |
 | `--axes` | `0 1 2` | Axes to evaluate: `0` = lateral (left/right), `1` = depth (front/behind), `2` = vertical (above/below) |
+| `--prompt_format` | `boolean` | `boolean`: 6 true/false fields per query; `enum`: 3 fields with exclusive string choices (`left`/`right`/`neither` etc.) — reduces yes-bias in models like Qwen |
 | `--dataset_dir` | `dataset` | Dataset index directory |
 | `--output_dir` | `results` | Root directory for outputs |
 | `--seed` | `42` | Random seed for group shuffling |
