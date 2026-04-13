@@ -1807,16 +1807,18 @@ def parse_args() -> argparse.Namespace:
         help="Render in original scene colours without highlighting objects or converting to grayscale.",
     )
     p.add_argument(
-        "--reference-object",
-        action="store_true",
-        default=False,
-        help="Add a coloured arrow pointing toward the midpoint between the two highlighted objects, placed at a position visible from at least 2 viewpoints.",
+        "--no-reference-object",
+        dest="reference_object",
+        action="store_false",
+        default=True,
+        help="Disable the coloured arrow that is placed pointing toward the midpoint between the two highlighted objects. Arrow is included by default.",
     )
     p.add_argument(
-        "--print-reference-image",
-        action="store_true",
-        default=False,
-        help="Render an additional image from the arrow's viewpoint and save it as objA_x_objB_y_view_arrow.png. Requires --reference-object.",
+        "--no-print-reference-image",
+        dest="print_reference_image",
+        action="store_false",
+        default=True,
+        help="Disable rendering of the additional image from the arrow's viewpoint (objA_x_objB_y_view_arrow.png). Rendered by default.",
     )
     p.add_argument(
         "--max-arrow-occlusion",
