@@ -176,12 +176,14 @@ class QwenAdapter(ModelAdapter):
         from transformers import BitsAndBytesConfig
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
+            llm_int8_skip_modules=["visual"],
         )
         self._model_obj = AutoModelForCausalLM.from_pretrained(
-            model_id, device_map="auto", trust_remote_code=True, quantization_config=bnb_config,
+            model_id, trust_remote_code=True, quantization_config=bnb_config,
+            fp16=True,
         ).eval()
 
     def query(self, image_path: Path, prompt: str) -> str:

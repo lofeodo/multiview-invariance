@@ -32,7 +32,7 @@ conda install pytorch torchvision pytorch-cuda=12.4 -c pytorch -c nvidia
 ```
 Then install the remaining packages:
 ```bash
-pip install numpy Pillow tqdm "transformers==4.40.2" accelerate bitsandbytes tiktoken einops transformers_stream_generator
+pip install numpy Pillow tqdm "transformers==4.40.2" "accelerate==0.30.0" bitsandbytes tiktoken einops transformers_stream_generator
 ```
 
 > `bitsandbytes` enables 4-bit quantization, which is required to run LLaVA or Qwen within typical GPU VRAM budgets. On Windows, use `pip install bitsandbytes --upgrade` to ensure you have v0.43+ (earlier versions had no Windows support).
