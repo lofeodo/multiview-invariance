@@ -1,21 +1,27 @@
 # multiview-invariance
 
-A toolkit for evaluating **VLM cross-viewpoint spatial reasoning invariance** using ScanNet 3D scenes.
+A benchmark for evaluating **spatial reasoning** and **cross-viewpoint invariance** in vision-language models (VLMs), using reconstructed 3D scenes from ScanNet.
 
-The core idea: given a reconstructed 3D scene, analytically find camera placements where the apparent spatial relation between two objects (e.g. "A is left of B") flips between viewpoints. Rendered image pairs/triplets are then used to probe whether vision-language models give consistent spatial relation judgments across viewpoints.
+The core capability being tested is *mental viewpoint shifting*: can a model look at a scene from one camera angle, imagine standing somewhere else inside that scene, and correctly reason about how the spatial relations between objects change from that imagined perspective?
 
-An optional **reference arrow** can be placed in the scene pointing toward the midpoint between the two highlighted objects, serving as an unambiguous spatial anchor for the pair. The arrow's own viewpoint is recorded and can be rendered as an additional image.
+Each benchmark query renders a 3D scene from a fixed camera position. Two objects in the scene are color-highlighted, and a colored arrow is overlaid — placed at a physically valid position in the scene and pointing toward the midpoint between the two objects. The model must imagine standing at the arrow's position, looking in its direction, and predict the spatial relations between the two objects from that perspective (e.g. "is A to the left or right of B?", "is A in front of or behind B?"). Ground truth is computed analytically from the arrow's camera pose.
+
+Each object pair is rendered from two different camera positions. Because both viewpoints share the same arrow and therefore the same ground truth, we can measure two things independently: (1) whether the model's predictions are **accurate**, and (2) whether they are **consistent across viewpoints** — i.e. whether the model gives the same answer regardless of which camera angle it sees the scene from. A model that reasons correctly about 3D space should be invariant to the camera angle of the rendered image.
 
 ---
 
 ## Quick start
 
+### Install dependencies
+
+**Dataset generation** (`generate_viewpoint_pairs.py`, `download_scenes.py`):
 ```bash
 python download_scenes.py --scenes 0
 python generate_viewpoint_pairs.py --reference-object --print-reference-image --scene_dir scannet_data/scene0000_00
 ```
 
 ---
+
 
 ## Setup
 
@@ -25,6 +31,7 @@ python generate_viewpoint_pairs.py --reference-object --print-reference-image --
 pip install open3d numpy Pillow pyvista huggingface_hub openai
 ```
 
+**Benchmark — API models** (`chatgpt`, `gemini`):
 | Package | Purpose |
 |---|---|
 | `open3d` | Mesh loading, raycasting (occlusion checks) |
@@ -40,9 +47,9 @@ pip install open3d numpy Pillow pyvista huggingface_hub openai
 
 ## ChatGPT / OpenAI API
 
-The repo now includes a small multimodal client in `chatgpt_api.py`. It sends
-a text prompt plus one or more images to the OpenAI Responses API and returns
-the model's text reply.
+The repo includes a small standalone multimodal client in `chatgpt_api.py` for
+ad-hoc use. It sends a text prompt plus one or more images to the OpenAI
+Responses API and returns the model's text reply.
 
 Set your API key first:
 
@@ -59,33 +66,10 @@ python chatgpt_api.py \
            outputs/scene0000_00/images/objA_3_objB_7_view_1.png
 ```
 
-You can also import it from Python:
-
-```python
-from chatgpt_api import ChatGPTVisionClient
-
-client = ChatGPTVisionClient(model="gpt-4.1-mini")
-result = client.prompt_with_images(
-    prompt="What changed between these two viewpoints?",
-    image_sources=[
-        "outputs/scene0000_00/images/objA_3_objB_7_view_0.png",
-        "outputs/scene0000_00/images/objA_3_objB_7_view_1.png",
-    ],
-)
-print(result.text)
-```
-
-For dataset-driven evaluation, use `run_chatgpt_benchmark.py`. It loads
-groups from `dataset/`, sends each group's viewpoint images to the API, and
-writes one JSONL result per group.
-
-```bash
-python run_chatgpt_benchmark.py \
-  --index-dir dataset \
-  --system-prompt-file prompts/system.txt \
-  --question "For each image, is object A left of object B?" \
-  --output results/chatgpt_results.jsonl
-```
+For dataset-driven evaluation, use `benchmark.py --model chatgpt`. This uses
+the OpenAI Responses API with server-side structured output enforcement
+(`json_schema` for enum format) and records per-query latency and cost
+estimates in `metrics.json`.
 
 ---
 
@@ -112,387 +96,239 @@ Each scene directory (e.g. `scannet_data/scene0000_00/`) contains:
 Download specific scenes by ID, a contiguous range, or all scenes. `--scenes`, `--upto`, and `--from` are mutually exclusive.
 
 ```bash
-# Download a specific set of scenes
-python download_scenes.py --scenes 0 1 2
-
-# Download the first N scenes (scene0000_00 through scene000N-1_00)
-python download_scenes.py --upto 10
-
-# Download scene N and every subsequent scene
-python download_scenes.py --from 210
-
-# Download all scenes
-python download_scenes.py
+pip install numpy Pillow tqdm openai google-generativeai
 ```
 
-Files are saved to `./scannet_data/`.
+**Benchmark — local models** (`llava`, `qwen`):
+
+Install PyTorch first. For NVIDIA GPUs (recommended via conda):
+```bash
+conda install pytorch torchvision pytorch-cuda=12.4 -c pytorch -c nvidia
+```
+Then install the remaining packages:
+```bash
+pip install numpy Pillow tqdm "transformers==4.40.2" "accelerate==0.30.0" bitsandbytes tiktoken einops transformers_stream_generator
+```
+
+> `bitsandbytes` enables 4-bit quantization, which is required to run LLaVA or Qwen within typical GPU VRAM budgets. On Windows, use `pip install bitsandbytes --upgrade` to ensure you have v0.43+ (earlier versions had no Windows support).
+
+### Run the benchmark
+
+```bash
+# API models
+python benchmark.py --model chatgpt --api_key sk-...
+python benchmark.py --model gemini  --api_key AI...
+
+# Local models (no API key needed)
+python benchmark.py --model llava
+python benchmark.py --model qwen
+
+# Use boolean prompt format (enum is the default; boolean uses true/false fields)
+python benchmark.py --model qwen --prompt_format boolean
+
+# Restrict to specific spatial axes or a smaller sample
+python benchmark.py --model chatgpt --api_key sk-... --axes 0 1 --n_viewpoints 100
+
+# ChatGPT with reasoning and custom image detail
+python benchmark.py --model chatgpt --api_key sk-... --reasoning_effort medium --detail high
+```
 
 ---
 
-### 2. `view_scene.py` — Interactive 3D viewer
+## Benchmark script
 
-Open an interactive Open3D window to inspect a scene mesh.
+### Models
 
-```bash
-python view_scene.py --scene 0
-python view_scene.py --scene scene0000_00
-```
+| `--model` | Backend | Default version |
+|---|---|---|
+| `chatgpt` | OpenAI API | `gpt-4o` |
+| `gemini` | Google Generative AI API | `gemini-1.5-flash` |
+| `llava` | Local via `transformers` | `llava-hf/llava-v1.6-mistral-7b-hf` |
+| `qwen` | Local via `transformers` | `Qwen/Qwen-VL-Chat` |
 
-Uses the vertex-colored mesh (`_vh_clean_2.ply`). Requires a display.
+Override the version with `--model_id`, e.g. `--model_id gpt-4o-mini`.
 
----
-
-### 3. `generate_viewpoint_pairs.py` — Generate viewpoint pairs (main script)
-
-The main pipeline. For each scene it:
-
-1. Loads the mesh and instance annotations
-2. Applies the axis-alignment matrix so the floor is flat and the up axis is detected automatically
-3. Filters out structural elements (walls, floor, ceiling, etc.) and tiny objects
-4. Enumerates all object pairs within a configurable distance range
-5. Finds candidate viewpoints for each pair irrespective of any arrow position
-6. For each pair, searches for a valid arrow position (visible from ≥ 2 viewpoints, not occluded, not embedded in geometry, at a safe minimum distance from each highlighted object)
-7. If no valid arrow position is found, the pair is skipped
-8. Validates each camera (geometry proximity, per-object occlusion, frustum coverage, projected size)
-9. Renders images with the two target objects highlighted in distinct colors against a grayscale background, with the reference arrow drawn as a flat indicator pointing toward the pair midpoint
-10. Saves rendered images and a full metadata JSON
-
-#### Single scene
-
-```bash
-python generate_viewpoint_pairs.py --scene_dir scannet_data/scene0000_00
-```
-
-#### Batch (all scenes under a directory)
-
-```bash
-python generate_viewpoint_pairs.py --scene_dir scannet_data --batch
-```
-
-#### All options
+### Arguments
 
 | Argument | Default | Description |
 |---|---|---|
-| `--scene_dir` | *(required)* | Path to a scene dir, or root dir when using `--batch` |
-| `--output_dir` | `outputs` | Root directory for all outputs |
-| `--batch` | off | Process all `scene*` subdirs under `--scene_dir` |
-| `--skip_existing` | off | Skip any scene whose output directory already exists under `--output_dir` |
-| `--first_variant_only` | off | In batch mode, only process the first variant of each scene number (`sceneXXXX_00`), ignoring `_01`, `_02`, etc. |
-| `--min_object_volume` | `0.2` m³ | Skip objects smaller than this (removes clutter) |
-| `--min_centroid_distance` | `0.5` m | Minimum distance between object pair centroids |
-| `--max_centroid_distance` | `5.0` m | Maximum distance between object pair centroids |
-| `--standoff_distance_factor` | `1.5` | Camera standoff = this × centroid distance |
-| `--standoff_min` | `1.0` m | Minimum camera standoff distance |
-| `--standoff_max` | `4.0` m | Maximum camera standoff distance |
-| `--camera_height` | `1.5` m | Camera height above floor |
-| `--fov` | `60` deg | Vertical field of view |
-| `--resolution_w` | `1024` px | Render width |
-| `--resolution_h` | `768` px | Render height |
-| `--min_projected_size` | `50` px | Reject viewpoints where an object's 2D bbox is smaller than this |
-| `--occlusion_ray_threshold` | `0.50` | Fraction of sample rays that must reach an object (else it's occluded) |
-| `--max_pairs_per_scene` | `6` | Cap on how many pairs to save per scene |
-| `--skip_labels` | *(see below)* | Space-separated object labels to ignore |
-| `--near_geom_dist` | `0.3` m | Camera is invalid if closer than this to any geometry |
-| `--full-colour` | off | Render in original scene colours; disables grayscale conversion and object highlighting |
-| `--reference-object` | off | Place a coloured arrow in each scene pointing toward the midpoint between the two highlighted objects |
-| `--print-reference-image` | off | Render an extra image from the arrow's own viewpoint and save it as `objA_x_objB_y_view_arrow.png`. Requires `--reference-object` |
-| `--max-arrow-occlusion` | `0.8` | Minimum fraction of arrow sample rays that must reach the arrow unblocked from a viewpoint (0–1). Used to determine whether the arrow is visible from each camera |
-| `--verbose_output` | off | Include all technical fields in the metadata JSON (`axis_alignment_applied`, `camera_conventions`, `color_rgb`, `pose`, `flipped_relations`, `fov_degrees`, `image_resolution`, `viewpoint_label`). Off by default for a cleaner output |
-| `--seed` | `42` | Random seed (controls pair enumeration order) |
-| `--log_level` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
+| `--model` | *(required)* | Model to benchmark |
+| `--api_key` | — | Required for `chatgpt` and `gemini` |
+| `--model_id` | auto | Override the default model version |
+| `--n_viewpoints` | `500` | Total queries. Must be even; rounded down automatically if odd |
+| `--axes` | `0 1 2` | Axes to evaluate: `0` = lateral (left/right), `1` = depth (front/behind), `2` = vertical (above/below) |
+| `--prompt_format` | `enum` | `enum` (default): one exclusive string choice per axis (`left`/`right`/`neither` etc.); `boolean`: true/false for each direction. For `chatgpt`, enum enables strict server-side `json_schema` enforcement. |
+| `--reasoning_effort` | `none` | ChatGPT only. Reasoning effort for o-series / reasoning-capable models: `none`, `low`, `medium`, `high`, `xhigh`. |
+| `--max_output_tokens` | — | ChatGPT only. Cap on generated output tokens. |
+| `--detail` | `auto` | ChatGPT only. Image detail level: `auto`, `low`, `high`, `original`. |
+| `--dataset_dir` | `dataset` | Dataset index directory |
+| `--output_dir` | `results` | Root directory for outputs |
+| `--seed` | `42` | Random seed for group shuffling |
 
-**Default skipped labels:** `wall floor ceiling window door doorframe doorpane curtain blinds windowsill beam column pipe stair railing floor mat`
+### How it works
 
-To override the skip list entirely:
-```bash
-python generate_viewpoint_pairs.py --scene_dir scannet_data/scene0000_00 \
-    --skip_labels wall floor ceiling
-```
+Each query selects a group (one object pair) and a viewpoint image (`view_N.png`). The image already has the colored arrow overlaid. The model is prompted to imagine standing at the arrow and predict the spatial relations as a JSON object with boolean fields. Ground truth is the arrow-viewpoint spatial relations recorded in the dataset index.
 
----
+`--n_viewpoints` is divided by 2 to get the number of groups, so each group always contributes both its viewpoints (both viewpoints share the same ground truth, enabling consistency measurement).
 
-## Reference arrow
+### Outputs
 
-When `--reference-object` is passed, the pipeline places a flat coloured arrow in each accepted scene. The arrow:
+Results are written to `results/<model>_<timestamp>/`:
 
-- Points toward the midpoint between the two highlighted objects' centroids
-- Is rendered as a flat indicator lying in the horizontal plane (flat face perpendicular to the world up axis, so a horizontal arrow looks like a flat road sign)
-- Is placed at a fixed height above the floor (`0.7 m` by default)
-- Must be visible (≥ `--max-arrow-occlusion`, default 80%) from at least 2 of the selected viewpoints, verified via open-space raycasting from each camera to sample points along the arrow shaft
-- Must not be embedded inside any scene object (AABB check) or clipping into the scene mesh
-- Must be at a safe minimum distance from each highlighted object: the arrow centroid must be at least as far from object X's centroid as the longest bounding-box dimension of object X (checked for both A and B)
-- Both highlighted objects must also be sufficiently visible from the arrow's own camera pose, checked with the same raycasting occlusion logic used for regular viewpoints
-
-The arrow's camera pose is defined as:
-
-| Axis | Direction |
+| File | Contents |
 |---|---|
-| Forward | Arrow position → pair midpoint |
-| Up | World up (floor normal) |
-| Right | Cross(forward, up) |
+| `config.json` | Run configuration |
+| `predictions.jsonl` | Per-query: example id, ground truth, prediction, parse error, difficulty bin, latency, usage, cost |
+| `metrics.json` | All computed metrics, plus `run_stats` (latency and cost aggregates for chatgpt) |
 
-If `--print-reference-image` is also passed, an image is rendered from this pose (without the arrow itself, to avoid being inside it) and saved alongside the viewpoint images.
+Predictions stream to disk as they arrive, so a partial run is not lost if interrupted.
 
-Object pairs for which no valid arrow position can be found are skipped entirely.
+### Metrics
 
----
+**Structural**
+- `parse_error_rate` — fraction of responses with no extractable JSON
+- `invalid_rate` — fraction of parsed responses that are structurally invalid (both directions true on any axis, or all values false)
 
-## Outputs
+**Per-axis** (lateral / depth / vertical; computed on clean predictions)
+- `accuracy` — fraction matching ground truth
+- `macro_f1` — macro-averaged F1 over 3 classes: `positive` / `negative` / `neither`
 
-```
-outputs/
-├── scene0000_00/
-│   ├── images/
-│   │   ├── objA_3_objB_7_view_0.png          # viewpoint 0
-│   │   ├── objA_3_objB_7_view_1.png          # viewpoint 1 (relation flipped)
-│   │   ├── objA_3_objB_7_view_2.png          # optional diagonal viewpoint
-│   │   ├── objA_3_objB_7_view_arrow.png      # arrow viewpoint (--print-reference-image)
-│   │   └── ...
-│   └── metadata.json
-└── viewpoints/
-    └── scene0000_00/
-        └── ...                               # same images, mirrored here
-```
+**Joint** (over clean predictions)
+- `exact_match_accuracy` — all active axes correct simultaneously
+- `partial_correctness` — count and fraction for every combination of which axes were correct
 
-### Image format
+**Viewpoint consistency** (cross-viewpoint, per group)
+- `consistent_rate` — fraction of groups where the model gives identical predictions on both viewpoints
+- `consistent_correct_rate` — consistent and correct
+- `consistent_wrong_rate` — consistent but wrong (systematic bias)
+- `inconsistent_rate` — prediction flips between viewpoints
+- `per_axis` — per-axis consistency and flip rates
 
-By default, rendered images show the scene in **grayscale** with the two target objects highlighted in **distinct colors** (e.g. object A in yellow, object B in blue). A coloured arrow (e.g. orange) is overlaid when `--reference-object` is active. Colors are assigned per-pair from a rotating palette and recorded in the metadata.
+**Diagnostic**
+- `confusion_matrices` — per axis; rows = ground truth `{positive, negative, neither}`, columns = predicted `{positive, negative, neither, invalid}`
+- `directional_bias` — per-direction true-rate in dataset ground truth vs. model predictions
 
-When `--full-colour` is passed, images are rendered in the original scene colors with no object highlighting or grayscale conversion.
+**Run stats** (`run_stats` key; ChatGPT only for cost fields)
+- `total_latency_seconds`, `avg_latency_seconds` — wall-clock query time
+- `total_estimated_cost_usd` — approximate cost based on published token pricing
+- `total_input_tokens`, `total_output_tokens`, `total_cached_input_tokens` — token counts
 
-The arrow-view image (`_view_arrow.png`) does **not** include the arrow itself, so both highlighted objects are fully visible from the arrow's perspective.
+**Difficulty bins** — all of the above repeated within five bins defined by `|yaw_to_arrow|` (camera-to-arrow misalignment):
 
-### metadata.json structure
-
-```json
-{
-  "scene_id": "scene0000_00",
-  "axis_alignment_applied": true,
-  "up_axis": "Y",
-  "camera_conventions": "OpenCV (x-right, y-down, z-forward)",
-  "viewpoint_groups": [
-    {
-      "pair_id": "3_7",
-      "object_A": {
-        "instance_id": 3,
-        "label": "chair",
-        "color": "yellow",
-        "color_rgb": [1.0, 0.85, 0.0]
-      },
-      "object_B": {
-        "instance_id": 7,
-        "label": "table",
-        "color": "blue",
-        "color_rgb": [0.15, 0.45, 1.0]
-      },
-      "reference_object_arrow": {
-        "color": "orange",
-        "color_rgb": [1.0, 0.5, 0.0],
-        "pose": {
-          "position_world": [-0.50, 1.69, 0.67],
-          "forward_world":  [0.82, -0.12, 0.56],
-          "right_world":    [0.57,  0.00, -0.82],
-          "up_world":       [0.10,  0.99,  0.07],
-          "up_convention":  "world_up — camera up-axis is aligned with the floor normal (axis 1)",
-          "w2c_matrix":     [["...4x4 row-major OpenCV extrinsic matrix..."]],
-          "fov_degrees":    60.0,
-          "image_resolution": [1024, 768]
-        },
-        "spatial_relations_from_arrow": {
-          "A_left_of_B": false,
-          "A_right_of_B": true,
-          "A_in_front_of_B": true,
-          "A_behind_B": false,
-          "A_above_B": false,
-          "A_below_B": false
-        },
-        "image_path": "images/objA_3_objB_7_view_arrow.png"
-      },
-      "viewpoints": [
-        {
-          "viewpoint_index": 0,
-          "image_path": "images/objA_3_objB_7_view_0.png",
-          "fov_degrees": 60,
-          "image_resolution": [1024, 768],
-          "spatial_relations": {
-            "A_left_of_B": true,
-            "A_right_of_B": false,
-            "A_in_front_of_B": false,
-            "A_behind_B": true,
-            "A_above_B": false,
-            "A_below_B": false
-          },
-          "viewpoint_label": "perp_pos",
-          "angular_sep_from_view0_deg": 0.0
-        }
-      ],
-      "flipped_relations": ["left_right"],
-      "viewpoint_angular_separation_degrees": 85.3
-    }
-  ]
-}
-```
-
-The `reference_object_arrow` block is only present when `--reference-object` is used. The `image_path` inside it is only present when `--print-reference-image` is also used.
-
-### Spatial relation conventions
-
-Each axis is represented by a complementary pair. Both members of a pair cannot be true simultaneously, but both can be false when the objects are too close together along that axis (within the dead zone).
-
-| Field | Meaning when `true` |
+| Bin | Range |
 |---|---|
-| `A_left_of_B` | A appears more than 20 px to the left of B in the image (projected pixel x) |
-| `A_right_of_B` | A appears more than 20 px to the right of B in the image (projected pixel x) |
-| `A_in_front_of_B` | A is more than 0.1 m closer to the camera than B (camera-space depth) |
-| `A_behind_B` | A is more than 0.1 m further from the camera than B (camera-space depth) |
-| `A_above_B` | A's centroid is more than 0.1 m higher than B's **and** A's bounding-box bottom is more than 0.1 m higher than B's (world-space up axis) |
-| `A_below_B` | A's centroid is more than 0.1 m lower than B's **and** A's bounding-box bottom is more than 0.1 m lower than B's (world-space up axis) |
-
-Left/right uses projected pixel coordinates (image-plane x, including perspective division), matching what appears visually left/right in the rendered image. Above/below requires both the centroid and the bounding-box bottom of A to be strictly higher (or lower) than B's by at least 0.1 m, using world-space up-axis coordinates; this is independent of camera perspective. Front/behind uses camera-space depth.
-
-The `flipped_relations` list tells you which of these flipped across the viewpoint pair, e.g. `["left_right"]` means view 0 has A-left-of-B and view 1 has A-right-of-B.
-
-Spatial relations in `spatial_relations_from_arrow` follow the same conventions but are computed from the arrow's camera pose rather than from any of the regular viewpoints.
+| `aligned` | 0° – 30° |
+| `slight` | 30° – 60° |
+| `moderate` | 60° – 120° |
+| `strong` | 120° – 150° |
+| `extreme` | 150° – 180° |
 
 ---
 
-## Typical workflow
+## Dataset
 
-### Part 1 — Data generation
-
-```bash
-# 1. Download scenes (specific, range, or all)
-python download_scenes.py --scenes 0 1 2  # specific
-python download_scenes.py --upto 10       # first 10
-python download_scenes.py --from 210      # scene 210 and onwards
-python download_scenes.py                 # all
-
-# 2. (Optional) visually inspect one
-python view_scene.py --scene 0
-
-# 3. Generate viewpoint pairs with reference arrows
-python generate_viewpoint_pairs.py \
-    --scene_dir scannet_data/scene0000_00 \
-    --reference-object --print-reference-image
-
-# 4. Batch-process everything downloaded, skipping scenes already processed
-python generate_viewpoint_pairs.py \
-    --scene_dir scannet_data --batch \
-    --max_pairs_per_scene 30 \
-    --reference-object --print-reference-image \
-    --skip_existing
-```
-
-### Part 2 — Dataset consolidation and benchmarking
-
-After generating outputs for one or more scenes, build a single global index and load it for benchmarking.
-
-```bash
-# 5. Build the consolidated dataset index (reads all outputs/*/metadata.json)
-python build_dataset_index.py
-
-# Re-run any time you add new scene outputs to keep the index up to date.
-# Previously written index files are overwritten.
-```
-
-This creates:
+The dataset index lives in `dataset/` and is produced by `build_dataset_index.py`. It contains three JSONL files:
 
 ```
 dataset/
     scenes.jsonl    — one record per scene
-    groups.jsonl    — one record per object pair (group)
-    examples.jsonl  — one record per viewpoint image (example)
+    groups.jsonl    — one record per object pair
+    examples.jsonl  — one record per viewpoint image
 ```
 
-```python
-# 6. Load the dataset in your benchmark script
-from dataset import MultiviewDataset
+Key fields used by the benchmark:
 
-ds = MultiviewDataset("dataset")
-print(ds)
-# MultiviewDataset(700 scenes, 2100 groups, 4200 examples)
+| File | Field | Description |
+|---|---|---|
+| `groups.jsonl` | `object_A`, `object_B` | Instance id, semantic label, highlight color |
+| `groups.jsonl` | `reference_object_arrow` | Arrow color and `spatial_relations_from_arrow` (ground truth) |
+| `examples.jsonl` | `image_path` | Project-root-relative path to the PNG |
+| `examples.jsonl` | `yaw_to_arrow` | Camera-to-arrow yaw misalignment (used for difficulty binning) |
 
-# Iterate examples — all viewpoints for the same pair are always adjacent
-for example in ds.iter_examples():
-    image = example["image_path"]         # e.g. "outputs/scene0700_00/images/..."
-    labels = example["spatial_relations"] # dict of bool flags
-    group = example["group_id"]           # e.g. "scene0700_00__10_11"
-
-# Iterate by group (one group = one object pair across all its viewpoints)
-for group, examples in ds.iter_groups():
-    print(group["group_id"], "→", len(examples), "viewpoints")
-
-# Get all viewpoints for a specific pair
-examples = ds.get_group_examples("scene0700_00__10_11")
-
-# Shuffle groups globally before benchmarking
-# Viewpoints within each group always stay together — the group is atomic
-ds.shuffle_groups(seed=42)
-
-# Train / test split — split unit is the scene, so no scene leaks across splits
-train_ds, test_ds = ds.split_by_scene(train_frac=0.8, seed=42)
-print(len(train_ds.scenes), "train /", len(test_ds.scenes), "test scenes")
-```
+The `dataset.py` module provides a Python loader with group-level shuffling and scene-level train/test splitting.
 
 ---
 
-## Consolidated dataset schema
+## Building the dataset from scratch
 
-### scenes.jsonl
+If you need to regenerate or extend the dataset:
 
-| Field | Type | Description |
+### 1. Download scenes
+
+```bash
+python download_scenes.py --scenes 0 1 2   # specific scenes
+python download_scenes.py --upto 10        # first N scenes
+python download_scenes.py --from 210       # scene 210 onwards
+python download_scenes.py                  # all scenes
+```
+
+Scene data is downloaded from `zahidpichen/scannet-dataset` on Hugging Face and stored under `scannet_data/`.
+
+### 2. Generate viewpoint pairs
+
+```bash
+# Single scene
+python generate_viewpoint_pairs.py \
+    --scene_dir scannet_data/scene0000_00
+
+# Batch (all scenes, skip already-processed)
+python generate_viewpoint_pairs.py \
+    --scene_dir scannet_data --batch \
+    --skip_existing --first_variant_only
+```
+
+Key arguments:
+
+| Argument | Default | Description |
 |---|---|---|
-| `scene_id` | str | e.g. `"scene0700_00"` |
-| `n_groups` | int | Number of object pairs in this scene |
+| `--scene_dir` | *(required)* | Scene dir or root dir (with `--batch`) |
+| `--output_dir` | `outputs` | Root directory for rendered images and metadata |
+| `--batch` | off | Process all `scene*` subdirs |
+| `--skip_existing` | off | Skip scenes whose output dir already exists |
+| `--first_variant_only` | off | Only process `sceneXXXX_00`, skip `_01`, `_02`, etc. |
+| `--no-reference-object` | — | Disable the colored arrow (arrow is placed by default) |
+| `--no-print-reference-image` | — | Disable rendering the arrow-viewpoint image (rendered by default) |
+| `--full-colour` | off | Render in original scene colours without highlighting or grayscale |
+| `--resolution_w` | `1024` | Output image width in pixels |
+| `--resolution_h` | `768` | Output image height in pixels |
+| `--fov` | `60.0` | Camera field of view in degrees |
+| `--camera_height` | `1.5` | Camera height above floor in metres |
+| `--max_pairs_per_scene` | `6` | Cap on pairs saved per scene |
+| `--min_object_volume` | `0.2` | Minimum object volume in m³ |
+| `--min_centroid_distance` | `0.5` | Minimum distance between object centroids in metres |
+| `--max_centroid_distance` | `5.0` | Maximum distance between object centroids in metres |
+| `--standoff_distance_factor` | `1.5` | Viewpoint standoff as a multiple of centroid distance |
+| `--standoff_min` | `1.0` | Minimum standoff distance in metres |
+| `--standoff_max` | `4.0` | Maximum standoff distance in metres |
+| `--min_projected_size` | `50` | Minimum object 2D bounding-box side length in pixels |
+| `--occlusion_ray_threshold` | `0.5` | Fraction of rays that must reach an object (occlusion check) |
+| `--max-arrow-occlusion` | `0.8` | Fraction of rays that must reach the arrow unblocked |
+| `--near_geom_dist` | `0.3` | Camera collision threshold in metres |
+| `--skip_labels` | — | Space-separated object labels to exclude |
+| `--verbose_output` | off | Include all technical fields in metadata JSON |
+| `--seed` | `42` | Random seed |
 
-### groups.jsonl
+> **Windows note:** Open3D's `OffscreenRenderer` requires EGL (Linux only). This repo uses PyVista instead, which works headlessly on Windows via VTK software rendering.
 
-| Field | Type | Description |
-|---|---|---|
-| `group_id` | str | `{scene_id}__{pair_id}`, e.g. `"scene0700_00__10_11"` |
-| `scene_id` | str | Parent scene |
-| `pair_id` | str | `{instance_id_A}_{instance_id_B}` |
-| `object_A` | dict | `instance_id`, `label`, `color` |
-| `object_B` | dict | `instance_id`, `label`, `color` |
-| `reference_object_arrow` | dict? | Arrow metadata (present when `--reference-object` was used) |
-| `n_viewpoints` | int | Number of rendered viewpoints for this pair |
-| `viewpoint_angular_separation_degrees` | float | Angular separation between view 0 and view 1 |
+### 3. Build the index
 
-### examples.jsonl
+```bash
+python build_dataset_index.py
+```
 
-| Field | Type | Description |
-|---|---|---|
-| `example_id` | str | `{scene_id}__{pair_id}__view_{i}`, e.g. `"scene0700_00__10_11__view_0"` |
-| `group_id` | str | Parent group |
-| `scene_id` | str | Parent scene |
-| `pair_id` | str | `{instance_id_A}_{instance_id_B}` |
-| `viewpoint_index` | int | Index within the group (0, 1, …) |
-| `image_path` | str | Project-root-relative path to the PNG, e.g. `"outputs/scene0700_00/images/..."` |
-| `spatial_relations` | dict | Six bool flags (see *Spatial relation conventions* above) |
-| `angular_sep_from_view0_deg` | float | Degrees from view 0 to this view |
-| `yaw_to_arrow` | float? | Yaw misalignment between camera and arrow (when `--reference-object` was used) |
+Reads all `outputs/*/metadata.json` files and writes `dataset/`. Re-run any time new scenes are added.
 
 ---
 
-## How to do a correct train / test split
+## Spatial relation conventions
 
-The correct split unit is the **scene** (not the example or group).  Using any smaller unit risks leaking related views of the same object pair into both splits, which inflates test accuracy.
+Relations are computed from the arrow's camera pose and stored in `spatial_relations_from_arrow`. Both members of a complementary pair can be false (neither), but cannot both be true.
 
-```python
-from dataset import MultiviewDataset
-
-ds = MultiviewDataset("dataset")
-train_ds, test_ds = ds.split_by_scene(train_frac=0.8, seed=42)
-
-# Every scene appears in exactly one split.
-train_scene_ids = {s["scene_id"] for s in train_ds.scenes}
-test_scene_ids  = {s["scene_id"] for s in test_ds.scenes}
-assert train_scene_ids.isdisjoint(test_scene_ids)  # guaranteed
-
-# Benchmark on the test set with shuffled group order
-test_ds.shuffle_groups(seed=0)
-for example in test_ds.iter_examples():
-    ...
-```
-
-`split_by_scene` shuffles scene IDs with `seed`, then takes the first `train_frac` fraction as train and the rest as test.  Re-running with the same seed always produces the same split.
+| Field | Meaning when `true` |
+|---|---|
+| `A_left_of_B` | A appears more than 20 px left of B in the image |
+| `A_right_of_B` | A appears more than 20 px right of B in the image |
+| `A_in_front_of_B` | A is more than 0.1 m closer to the camera than B |
+| `A_behind_B` | A is more than 0.1 m farther from the camera than B |
+| `A_above_B` | A's centroid and bounding-box bottom are both more than 0.1 m above B's (world up axis) |
+| `A_below_B` | A's centroid and bounding-box bottom are both more than 0.1 m below B's (world up axis) |
