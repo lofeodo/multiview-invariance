@@ -10,6 +10,12 @@ Each object pair is rendered from two different camera positions. Because both v
 
 ---
 
+## Poster
+
+![Project poster](vlm%20poster.png)
+
+---
+
 ## Quick start
 
 ### Install dependencies
