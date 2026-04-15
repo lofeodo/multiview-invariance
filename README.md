@@ -117,28 +117,15 @@ Lateral accuracy collapses from **83.6%** when the camera faces roughly the same
 
 ---
 
-## Quick start
-
-### Install dependencies
-
-**Dataset generation** (`generate_viewpoint_pairs.py`, `download_scenes.py`):
-```bash
-python download_scenes.py --scenes 0
-python generate_viewpoint_pairs.py --reference-object --print-reference-image --scene_dir scannet_data/scene0000_00
-```
-
----
-
-
 ## Setup
 
-### Requirements
+### Dependencies
 
-```
-pip install open3d numpy Pillow pyvista huggingface_hub openai
+**Dataset generation and rendering** (`download_scenes.py`, `generate_viewpoint_pairs.py`):
+```bash
+pip install open3d numpy Pillow pyvista huggingface_hub
 ```
 
-**Benchmark — API models** (`chatgpt`, `gemini`):
 | Package | Purpose |
 |---|---|
 | `open3d` | Mesh loading, raycasting (occlusion checks) |
@@ -146,43 +133,41 @@ pip install open3d numpy Pillow pyvista huggingface_hub openai
 | `Pillow` | Saving rendered images |
 | `pyvista` | Headless rendering (Windows-compatible via VTK) |
 | `huggingface_hub` | Downloading ScanNet scenes |
-| `openai` | Sending multimodal prompts (text + images) to ChatGPT/OpenAI models |
+
+**Benchmark — API models** (`chatgpt`, `gemini`):
+```bash
+pip install openai google-generativeai
+```
+
+**Benchmark — local models** (`llava`, `qwen`):
+
+Install PyTorch first. For NVIDIA GPUs (recommended via conda):
+```bash
+conda install pytorch torchvision pytorch-cuda=12.4 -c pytorch -c nvidia
+```
+Then:
+```bash
+pip install "transformers==4.40.2" "accelerate==0.30.0" bitsandbytes tiktoken einops transformers_stream_generator
+```
+
+> `bitsandbytes` enables 4-bit quantization, required to run LLaVA or Qwen within typical GPU VRAM budgets. On Windows, use `pip install bitsandbytes --upgrade` to ensure v0.43+ (earlier versions had no Windows support).
 
 > **Windows note:** Open3D's built-in `OffscreenRenderer` requires EGL (Linux only). This repo uses PyVista instead, which works headlessly on Windows via VTK software rendering.
 
 ---
 
-## ChatGPT / OpenAI API
-
-The repo includes a small standalone multimodal client in `chatgpt_api.py` for
-ad-hoc use. It sends a text prompt plus one or more images to the OpenAI
-Responses API and returns the model's text reply.
-
-Set your API key first:
-
-```powershell
-$env:OPENAI_API_KEY="your_api_key_here"
-```
-
-Example:
-
-```bash
-python chatgpt_api.py \
-  --prompt "Describe the spatial relation between the highlighted objects in these views." \
-  --images outputs/scene0000_00/images/objA_3_objB_7_view_0.png \
-           outputs/scene0000_00/images/objA_3_objB_7_view_1.png
-```
-
-For dataset-driven evaluation, use `benchmark.py --model chatgpt`. This uses
-the OpenAI Responses API with server-side structured output enforcement
-(`json_schema` for enum format) and records per-query latency and cost
-estimates in `metrics.json`.
-
----
-
-## Data
+## 1. Download ScanNet scenes
 
 Scene data is downloaded from the `zahidpichen/scannet-dataset` Hugging Face dataset and stored under `scannet_data/`.
+
+```bash
+python download_scenes.py --scenes 0 1 2   # specific scenes
+python download_scenes.py --upto 10        # first N scenes
+python download_scenes.py --from 210       # scene 210 onwards
+python download_scenes.py                  # all scenes
+```
+
+`--scenes`, `--upto`, and `--from` are mutually exclusive.
 
 Each scene directory (e.g. `scannet_data/scene0000_00/`) contains:
 
@@ -196,30 +181,83 @@ Each scene directory (e.g. `scannet_data/scene0000_00/`) contains:
 
 ---
 
-## Scripts
-
-### 1. `download_scenes.py` — Download ScanNet scenes
-
-Download specific scenes by ID, a contiguous range, or all scenes. `--scenes`, `--upto`, and `--from` are mutually exclusive.
+## 2. Generate viewpoint pairs
 
 ```bash
-pip install numpy Pillow tqdm openai google-generativeai
+# Single scene
+python generate_viewpoint_pairs.py \
+    --scene_dir scannet_data/scene0000_00
+
+# Batch (all scenes, skip already-processed)
+python generate_viewpoint_pairs.py \
+    --scene_dir scannet_data --batch \
+    --skip_existing --first_variant_only
 ```
 
-**Benchmark — local models** (`llava`, `qwen`):
+Key arguments:
 
-Install PyTorch first. For NVIDIA GPUs (recommended via conda):
+| Argument | Default | Description |
+|---|---|---|
+| `--scene_dir` | *(required)* | Scene dir or root dir (with `--batch`) |
+| `--output_dir` | `outputs` | Root directory for rendered images and metadata |
+| `--batch` | off | Process all `scene*` subdirs |
+| `--skip_existing` | off | Skip scenes whose output dir already exists |
+| `--first_variant_only` | off | Only process `sceneXXXX_00`, skip `_01`, `_02`, etc. |
+| `--no-reference-object` | — | Disable the colored arrow (arrow is placed by default) |
+| `--no-print-reference-image` | — | Disable rendering the arrow-viewpoint image (rendered by default) |
+| `--full-colour` | off | Render in original scene colours without highlighting or grayscale |
+| `--resolution_w` | `1024` | Output image width in pixels |
+| `--resolution_h` | `768` | Output image height in pixels |
+| `--fov` | `60.0` | Camera field of view in degrees |
+| `--camera_height` | `1.5` | Camera height above floor in metres |
+| `--max_pairs_per_scene` | `6` | Cap on pairs saved per scene |
+| `--min_object_volume` | `0.2` | Minimum object volume in m³ |
+| `--min_centroid_distance` | `0.5` | Minimum distance between object centroids in metres |
+| `--max_centroid_distance` | `5.0` | Maximum distance between object centroids in metres |
+| `--standoff_distance_factor` | `1.5` | Viewpoint standoff as a multiple of centroid distance |
+| `--standoff_min` | `1.0` | Minimum standoff distance in metres |
+| `--standoff_max` | `4.0` | Maximum standoff distance in metres |
+| `--min_projected_size` | `50` | Minimum object 2D bounding-box side length in pixels |
+| `--occlusion_ray_threshold` | `0.5` | Fraction of rays that must reach an object (occlusion check) |
+| `--max-arrow-occlusion` | `0.8` | Fraction of rays that must reach the arrow unblocked |
+| `--near_geom_dist` | `0.3` | Camera collision threshold in metres |
+| `--skip_labels` | — | Space-separated object labels to exclude |
+| `--verbose_output` | off | Include all technical fields in metadata JSON |
+| `--seed` | `42` | Random seed |
+
+---
+
+## 3. Build the dataset index
+
 ```bash
-conda install pytorch torchvision pytorch-cuda=12.4 -c pytorch -c nvidia
-```
-Then install the remaining packages:
-```bash
-pip install numpy Pillow tqdm "transformers==4.40.2" "accelerate==0.30.0" bitsandbytes tiktoken einops transformers_stream_generator
+python build_dataset_index.py
 ```
 
-> `bitsandbytes` enables 4-bit quantization, which is required to run LLaVA or Qwen within typical GPU VRAM budgets. On Windows, use `pip install bitsandbytes --upgrade` to ensure you have v0.43+ (earlier versions had no Windows support).
+Reads all `outputs/*/metadata.json` files and writes `dataset/`. Re-run any time new scenes are added.
 
-### Run the benchmark
+The index lives in `dataset/` and contains three JSONL files:
+
+```
+dataset/
+    scenes.jsonl    — one record per scene
+    groups.jsonl    — one record per object pair
+    examples.jsonl  — one record per viewpoint image
+```
+
+Key fields used by the benchmark:
+
+| File | Field | Description |
+|---|---|---|
+| `groups.jsonl` | `object_A`, `object_B` | Instance id, semantic label, highlight color |
+| `groups.jsonl` | `reference_object_arrow` | Arrow color and `spatial_relations_from_arrow` (ground truth) |
+| `examples.jsonl` | `image_path` | Project-root-relative path to the PNG |
+| `examples.jsonl` | `yaw_to_arrow` | Camera-to-arrow yaw misalignment (used for difficulty binning) |
+
+The `dataset.py` module provides a Python loader with group-level shuffling and scene-level train/test splitting.
+
+---
+
+## 4. Run the benchmark
 
 ```bash
 # API models
@@ -239,10 +277,6 @@ python benchmark.py --model chatgpt --api_key sk-... --axes 0 1 --n_viewpoints 1
 # ChatGPT with reasoning and custom image detail
 python benchmark.py --model chatgpt --api_key sk-... --reasoning_effort medium --detail high
 ```
-
----
-
-## Benchmark script
 
 ### Models
 
@@ -332,98 +366,31 @@ Predictions stream to disk as they arrive, so a partial run is not lost if inter
 
 ---
 
-## Dataset
+## ChatGPT / OpenAI API
 
-The dataset index lives in `dataset/` and is produced by `build_dataset_index.py`. It contains three JSONL files:
+The repo includes a small standalone multimodal client in `chatgpt_api.py` for
+ad-hoc use. It sends a text prompt plus one or more images to the OpenAI
+Responses API and returns the model's text reply.
 
+Set your API key first:
+
+```powershell
+$env:OPENAI_API_KEY="your_api_key_here"
 ```
-dataset/
-    scenes.jsonl    — one record per scene
-    groups.jsonl    — one record per object pair
-    examples.jsonl  — one record per viewpoint image
-```
 
-Key fields used by the benchmark:
-
-| File | Field | Description |
-|---|---|---|
-| `groups.jsonl` | `object_A`, `object_B` | Instance id, semantic label, highlight color |
-| `groups.jsonl` | `reference_object_arrow` | Arrow color and `spatial_relations_from_arrow` (ground truth) |
-| `examples.jsonl` | `image_path` | Project-root-relative path to the PNG |
-| `examples.jsonl` | `yaw_to_arrow` | Camera-to-arrow yaw misalignment (used for difficulty binning) |
-
-The `dataset.py` module provides a Python loader with group-level shuffling and scene-level train/test splitting.
-
----
-
-## Building the dataset from scratch
-
-If you need to regenerate or extend the dataset:
-
-### 1. Download scenes
+Example:
 
 ```bash
-python download_scenes.py --scenes 0 1 2   # specific scenes
-python download_scenes.py --upto 10        # first N scenes
-python download_scenes.py --from 210       # scene 210 onwards
-python download_scenes.py                  # all scenes
+python chatgpt_api.py \
+  --prompt "Describe the spatial relation between the highlighted objects in these views." \
+  --images outputs/scene0000_00/images/objA_3_objB_7_view_0.png \
+           outputs/scene0000_00/images/objA_3_objB_7_view_1.png
 ```
 
-Scene data is downloaded from `zahidpichen/scannet-dataset` on Hugging Face and stored under `scannet_data/`.
-
-### 2. Generate viewpoint pairs
-
-```bash
-# Single scene
-python generate_viewpoint_pairs.py \
-    --scene_dir scannet_data/scene0000_00
-
-# Batch (all scenes, skip already-processed)
-python generate_viewpoint_pairs.py \
-    --scene_dir scannet_data --batch \
-    --skip_existing --first_variant_only
-```
-
-Key arguments:
-
-| Argument | Default | Description |
-|---|---|---|
-| `--scene_dir` | *(required)* | Scene dir or root dir (with `--batch`) |
-| `--output_dir` | `outputs` | Root directory for rendered images and metadata |
-| `--batch` | off | Process all `scene*` subdirs |
-| `--skip_existing` | off | Skip scenes whose output dir already exists |
-| `--first_variant_only` | off | Only process `sceneXXXX_00`, skip `_01`, `_02`, etc. |
-| `--no-reference-object` | — | Disable the colored arrow (arrow is placed by default) |
-| `--no-print-reference-image` | — | Disable rendering the arrow-viewpoint image (rendered by default) |
-| `--full-colour` | off | Render in original scene colours without highlighting or grayscale |
-| `--resolution_w` | `1024` | Output image width in pixels |
-| `--resolution_h` | `768` | Output image height in pixels |
-| `--fov` | `60.0` | Camera field of view in degrees |
-| `--camera_height` | `1.5` | Camera height above floor in metres |
-| `--max_pairs_per_scene` | `6` | Cap on pairs saved per scene |
-| `--min_object_volume` | `0.2` | Minimum object volume in m³ |
-| `--min_centroid_distance` | `0.5` | Minimum distance between object centroids in metres |
-| `--max_centroid_distance` | `5.0` | Maximum distance between object centroids in metres |
-| `--standoff_distance_factor` | `1.5` | Viewpoint standoff as a multiple of centroid distance |
-| `--standoff_min` | `1.0` | Minimum standoff distance in metres |
-| `--standoff_max` | `4.0` | Maximum standoff distance in metres |
-| `--min_projected_size` | `50` | Minimum object 2D bounding-box side length in pixels |
-| `--occlusion_ray_threshold` | `0.5` | Fraction of rays that must reach an object (occlusion check) |
-| `--max-arrow-occlusion` | `0.8` | Fraction of rays that must reach the arrow unblocked |
-| `--near_geom_dist` | `0.3` | Camera collision threshold in metres |
-| `--skip_labels` | — | Space-separated object labels to exclude |
-| `--verbose_output` | off | Include all technical fields in metadata JSON |
-| `--seed` | `42` | Random seed |
-
-> **Windows note:** Open3D's `OffscreenRenderer` requires EGL (Linux only). This repo uses PyVista instead, which works headlessly on Windows via VTK software rendering.
-
-### 3. Build the index
-
-```bash
-python build_dataset_index.py
-```
-
-Reads all `outputs/*/metadata.json` files and writes `dataset/`. Re-run any time new scenes are added.
+For dataset-driven evaluation, use `benchmark.py --model chatgpt`. This uses
+the OpenAI Responses API with server-side structured output enforcement
+(`json_schema` for enum format) and records per-query latency and cost
+estimates in `metrics.json`.
 
 ---
 
