@@ -12,7 +12,108 @@ Each object pair is rendered from two different camera positions. Because both v
 
 ## Poster
 
-![Project poster](vlm%20poster.png)
+![Project poster](readme_files/vlm%20poster.png)
+
+---
+
+## Example data
+
+Each benchmark query consists of a scene image with two color-highlighted objects and a colored arrow indicating the imagined viewpoint. The model receives one of the two camera views (view\_0 or view\_1) and must predict the spatial relations of object A relative to object B as seen from the arrow's position. Both views share the same arrow and therefore the same ground truth, enabling cross-viewpoint consistency measurement.
+
+Below is one example pair (scene0155\_00, magenta table vs. teal whiteboard, yellow arrow):
+
+| View 0 (camera–arrow yaw: −170°) | View 1 (camera–arrow yaw: +10°) | Arrow viewpoint (ground truth) |
+|:---:|:---:|:---:|
+| ![view 0](readme_files/example_data/objA_3_objB_33_view_0.png) | ![view 1](readme_files/example_data/objA_3_objB_33_view_1.png) | ![arrow view](readme_files/example_data/objA_3_objB_33_view_arrow.png) |
+
+The arrow-viewpoint image (right) shows what the scene looks like from the imagined perspective. Ground truth is derived analytically from the arrow's camera pose — the model never sees this image.
+
+**Example prompt** (sent with view\_0 or view\_1):
+
+```
+You are standing at the yellow arrow in this image, looking in the direction it points.
+
+From that perspective, judge the spatial relations of the magenta object (table) relative
+to the teal object (whiteboard).
+
+For each axis, choose exactly one value from the options shown.
+
+Output ONLY the JSON object below. Replace each option list with your chosen value
+(a quoted string). Do not write anything before or after the JSON object.
+
+{
+  "lateral_relation": "left" or "right" or "neither",
+  "depth_relation": "in_front" or "behind" or "neither",
+  "vertical_relation": "above" or "below" or "neither"
+}
+```
+
+**Ground truth** (from arrow pose): `lateral=left`, `depth=behind`, `vertical=below`
+
+**GPT-4o responses on this pair:**
+
+| | View 0 (extreme misalignment, −170°) | View 1 (aligned, +10°) |
+|---|---|---|
+| Raw output | `{"lateral_relation":"right","depth_relation":"behind","vertical_relation":"neither"}` | `{"lateral_relation":"left","depth_relation":"in_front","vertical_relation":"below"}` |
+| Lateral | ❌ right (GT: left) | ✅ left |
+| Depth | ✅ behind | ❌ in\_front (GT: behind) |
+| Vertical | ❌ neither (GT: below) | ✅ below |
+
+The model's answers flip between viewpoints — it gives different predictions for the same object pair and the same arrow, depending on which camera angle it sees the scene from. This is the central failure mode the benchmark is designed to measure.
+
+---
+
+## Results
+
+Three models were evaluated: GPT-4o (2 500 queries), LLaVA-1.6-Mistral-7B and Qwen-VL-Chat (500 queries each). Figures below are from the `readme_files/results/` folder.
+
+### Overall accuracy and consistency
+
+![Model comparison](readme_files/results/fig1_model_comparison.png)
+
+![Accuracy and consistency](readme_files/results/fig2_accuracy_consistency.png)
+
+**Per-axis accuracy** (fraction of queries with correct prediction on that axis):
+
+| Model | n | Lateral | Depth | Vertical | Exact match (all axes) |
+|---|---|---|---|---|---|
+| GPT-4o | 2 500 | 46.8% | 45.4% | 62.0% | 14.8% |
+| LLaVA-1.6 | 500 | 50.2% | 48.0% | 8.0% | 2.6% |
+| Qwen-VL | 500 | 51.0% | 50.4% | 8.0% | 2.2% |
+
+**Viewpoint consistency** (measured per object pair across its two camera views):
+
+| Model | Consistent | Consistent + correct | Consistent + wrong | Inconsistent |
+|---|---|---|---|---|
+| GPT-4o | 11.6% | 2.7% | 8.9% | 88.4% |
+| LLaVA-1.6 | 84.0% | 2.4% | 81.6% | 16.0% |
+| Qwen-VL | 86.4% | 2.0% | 84.4% | 13.6% |
+
+LLaVA and Qwen are highly consistent — but almost always consistently wrong. They appear to collapse to a fixed output regardless of the scene. GPT-4o is more sensitive to scene content but still fails to reason correctly about the imagined viewpoint, and its predictions vary wildly between camera angles.
+
+### Accuracy vs. camera–arrow misalignment
+
+The benchmark bins queries by the yaw angle between the rendering camera and the arrow (i.e., how far the camera is from "looking the same direction as the arrow"). This measures how difficult the imagined perspective shift is.
+
+![Difficulty bins](readme_files/results/fig3_difficulty_bins.png)
+
+**GPT-4o accuracy by difficulty bin:**
+
+| Bin | Camera–arrow yaw | n | Lateral | Depth | Vertical | Exact match |
+|---|---|---|---|---|---|---|
+| Aligned | 0°–30° | 854 | 83.6% | 55.4% | 67.7% | 30.6% |
+| Slight | 30°–60° | 262 | 74.4% | 55.3% | 58.0% | 20.2% |
+| Moderate | 60°–120° | 529 | 28.7% | 39.3% | 50.9% | 5.1% |
+| Strong | 120°–150° | 363 | 19.3% | 39.9% | 58.7% | 5.0% |
+| Extreme | 150°–180° | 492 | **8.1%** | 33.5% | 68.9% | 2.2% |
+
+Lateral accuracy collapses from **83.6%** when the camera faces roughly the same direction as the arrow to **8.1%** when it faces the opposite direction — below random chance. Depth follows a similar but shallower trend. Vertical is largely unaffected because it depends on the world up-axis, not yaw orientation.
+
+### Per-axis breakdown and thinking budget
+
+![Per-axis accuracy](readme_files/results/fig5_per_axis_accuracy.png)
+
+![Thinking budget](readme_files/results/fig4_thinking_budget.png)
 
 ---
 

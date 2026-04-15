@@ -8,3 +8,4 @@ outputs.bak/*
 results/*
 *.ttf
 plots/*
+settings.local.json
