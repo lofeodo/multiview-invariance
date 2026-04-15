@@ -268,10 +268,15 @@ def fig4_thinking_budget():
     # — Gemini subplot —
     ax2.plot(gem_budgets, gem_values, marker="^", color=COLORS["gemini"],
              linewidth=2.5, markersize=9, zorder=3)
-    for bud, val in zip(gem_budgets, gem_values):
+    for bud, val, fname in zip(gem_budgets, gem_values, gem_files):
         ax2.annotate(f"{val:.1%}", (bud, val),
                      textcoords="offset points", xytext=(0, 10),
                      ha="center", fontsize=16)
+        err = load(fname)["parse_error_rate"]
+        if err > 0.01:
+            ax2.annotate(f"({err:.0%} rate-limited)", (bud, val),
+                         textcoords="offset points", xytext=(0, -18),
+                         ha="center", fontsize=11, color="#c0392b", style="italic")
     ax2.set_xscale("log")
     ax2.set_xticks(gem_budgets)
     ax2.set_xticklabels([str(b) for b in gem_budgets])
